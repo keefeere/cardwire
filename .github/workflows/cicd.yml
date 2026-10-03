@@ -12,6 +12,7 @@ concurrency:
 
 jobs:
   prepare:
+    if: github.repository == 'OpenGamingCollective/cardwire'
     runs-on: ubuntu-latest
     outputs:
       run_nix_vm: ${{ steps.files.outputs.run_nix_vm }}

@@ -4,6 +4,7 @@ on:
     types: [opened]
 jobs:
   auto-assign:
+    if: github.repository == 'OpenGamingCollective/cardwire'
     runs-on: ubuntu-latest
     permissions:
       issues: write

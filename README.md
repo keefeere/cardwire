@@ -1,6 +1,12 @@
 # cardwire
 A GPU manager for Linux for laptops and multi-GPU desktops, using eBPF LSM hooks.
 
+> **Downstream fork:** maintained at [keefeere/cardwire](https://github.com/keefeere/cardwire).
+> See [FORK.md](FORK.md) for the administrative PID API, atomic process policies,
+> independent builds, testing and deployment limitations. This is not an upstream release.
+
+[![Fork build and tests](https://github.com/keefeere/cardwire/actions/workflows/fork-build.yml/badge.svg)](https://github.com/keefeere/cardwire/actions/workflows/fork-build.yml)
+
 [![Packaging status](https://repology.amdmi3.ru/badge/vertical-allrepos/cardwire.svg)](https://repology.amdmi3.ru/project/cardwire/versions)
 
 [![GitHub License](https://img.shields.io/github/license/OpenGamingCollective/cardwire)](https://github.com/OpenGamingCollective/cardwire/blob/main/LICENSE)

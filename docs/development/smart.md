@@ -7,7 +7,7 @@ Cardwire owns its per-application policy. It does not depend on desktop environm
 Third parties that want to integrate with cardwire get three methods:
 
 - **Env**: the `CARDWIRE_` environment variables is a way to route a process to a GPU, The per-GPU environment can be fetched from the `Env` property of the GPU API. The env will always have priority over the other methods.
-- **PID via API**: `RequestProcessAccess` directly insert the PID in the `CW_ALLOWED_PID` eBPF HashMap. call it with the pid right after spawning it, or apply it to a process that is already running (Caution, App often scan for GPUs at launch).
+- **PID via API**: `RequestProcessAccess` atomically replaces the PID's `CW_PID_POLICY` entry. In this fork this administrative API requires an authenticated UID 0 system-bus caller. Apply it to an existing process (caution: applications often scan for GPUs at launch).
 - **Smart Policy**: As of 0.12.0, cardwire has its own Application Policy, the SmartPolicy interface lists known applications (`GetAppPolicies`), changes their persistent policy (`SetAppPolicy`) and announces discoveries (`NewAppAdded`).
 
 ## Introduction
@@ -18,15 +18,15 @@ This is what cardwire's smart mode was made for. Cardwire uses a mix of kernel-s
 
 ### Kernel-Space
 
-Using the eBPF program and the `tracepoint/sched/sched_process_exec` hooks, the kernel program notifies `cardwired` when a new process is executed, sending its pid using the `CW_EXEC_EVENTS` RING_BUF (in Smart and Manual modes). Once the process is received by `cardwired`, it will be analyzed in real-time and its pid will be inserted into the `CW_ALLOWED_PID` map (value always `0`) or the `CW_FORCED_PID` map (value is the GPU id)
+Using the eBPF program and the `tracepoint/sched/sched_process_exec` hooks, the kernel program notifies `cardwired` when a new process is executed, sending its pid using the `CW_EXEC_EVENTS` RING_BUF (in Smart and Manual modes). The analyzer may insert one `CW_PID_POLICY` entry. Its shared `u64` encoding represents either Allowed (`1 << 32`) or Forced (the `u32` GPU ID). There cannot be two conflicting entries for a PID.
 
-When a process exits, the kernel's `tracepoint/sched/sched_process_exit` removes the pid from both maps directly, preventing the maps from overflowing.
+Exec and main-thread exit hooks remove the PID's policy entry directly.
 
 ### Userspace
 
 It is responsible for making the actual decisions about whether a process is allowed to use a GPU. It is divided into three main components:
 
-- **`CardwireAnalyzer`**: A dedicated background task that listens to the `CW_EXEC_EVENTS` ring buffer (and the `CW_REPORT_EVENTS` ring for blocked-access logging). When it receives a new PID from the kernel eBPF, it invokes the analysis helpers. If the application passes, it populates the `CW_ALLOWED_PID` map (value always `0`) or the `CW_FORCED_PID` map (value is the GPU id).
+- **`CardwireAnalyzer`**: A dedicated background task that listens to the `CW_EXEC_EVENTS` ring buffer (and the `CW_REPORT_EVENTS` ring for blocked-access logging). It analyzes each new PID and inserts a `CW_PID_POLICY` entry using `BPF_NOEXIST`, preserving any administrative policy installed during analysis.
 - **`dynamic_analysis.rs`**: A set of helper functions used to analyze a process in real-time. By reading `/proc/<pid>/environ` and `/proc/<pid>/cmdline`, it checks for explicitly requested GPUs (like `CARDWIRE_ALLOW=1`, `CARDWIRE_FORCE_DGPU=1`, `CARDWIRE_FORCE_GPU=<gpu_id>`) or Steam games (`SteamAppId`), more to be added.
 - **`static_analysis.rs`**: A set of helper functions that analyze system data when the daemon starts. It scans the XDG data directories and watches them with inotify so new apps are picked up at install time. Every discovered app is blocked by default until the user allows it (will be changed in 0.13.0, with a toggleable setting).
 
@@ -55,29 +55,29 @@ sequenceDiagram
     Daemon->>Daemon: Check CARDWIRE_* env vars, Steam, XDG lists, SQLite policies
 
     alt Is Allowed?
-        Daemon->>Map: Insert PID into cw_allowed_pid
+        Daemon->>Map: Insert Allowed into CW_PID_POLICY if absent
     else Is Forced?
-        Daemon->>Map: Insert PID into cw_forced_pid with the GPU id
+        Daemon->>Map: Insert Forced GPU id into CW_PID_POLICY if absent
     else Not Allowed
         Daemon->>Daemon: Do nothing
     end
 
     Note over Proc,Kernel: 3. GPU Access & Directory Listing
     Proc->>Kernel: getdents64 / file_open (/dev/dri/)
-    Kernel->>Map: Check cw_allowed_pid and cw_forced_pid
+    Kernel->>Map: Read CW_PID_POLICY for PID and direct parent
 
     alt PID not in any map
         Kernel-->>Proc: hide GPU (Return -ENOENT)
         Kernel->>Daemon: Send block event (cw_report_events)
-    else PID in cw_allowed_pid
+    else Policy is Allowed
         Kernel-->>Proc: Allow dGPU and iGPU
-    else PID in cw_forced_pid (value = GPU id)
+    else Policy is Forced GPU id
         Kernel-->>Proc: Allow the forced GPU, hide the others (-ENOENT)
     end
 
     Note over Proc,Daemon: 4. Application Exit
     Proc->>Kernel: sched_process_exit
-    Kernel->>Kernel: Remove PID from cw_allowed_pid and cw_forced_pid
+    Kernel->>Kernel: Remove PID from CW_PID_POLICY
 ```
 
 ## Application policies
@@ -88,6 +88,8 @@ The `Forced` policy will be added in 0.13.0
 
 The policy for a process can be overridden at runtime through the `org.opengamingcollective.cardwire.SmartPolicy` D-Bus interface (`RequestProcessAccess`, `GetProcessStatus`, `GetAppPolicies`, `SetAppPolicy`). Note that `GetProcessStatus` returns an empty string (not `"Default"`) for unclassified processes.
 
-`RequestProcessAccess` accepts `Allow_dGPU`, `Force_dGPU`, and `Force_GPU` for an existing process even when that PID is not yet in either policy map. Repeating a request or changing its policy removes the opposite map entry if present, then inserts or updates the requested entry. A missing opposite entry is not an error; other map errors are still reported. `Default` remains a no-op, not a way to revoke a previous request.
+`RequestProcessAccess` accepts `Allow_dGPU`, `Force_dGPU`, and `Force_GPU` for an existing process after authenticating the sender as root. Each request makes one complete map update; an error preserves the previous entry. Concurrent requests cannot leave both Allow and Force active for one PID. `GetProcessStatus` reads that same entry. `Default` remains an authenticated no-op, not a way to revoke a previous request. The method's wire signature is unchanged.
+
+Status reports the PID's own policy, not inherited effects. Smart mode retains direct-parent Allow precedence; Manual mode ignores Allow entries. Numeric PID lifetime races, environment hints, built-in exemptions and authorization of other global APIs remain outside this change. See [the fork notes](../../FORK.md) for the security and deployment boundaries.
 
 Force_GPU can be used on all systems with the Manual mode.

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/cardwire-policy",
     "crates/cardwire-daemon",
     "crates/cardwire-cli",
     "crates/cardwire-ebpf",
@@ -9,6 +10,7 @@ members = [
 ]
 
 default-members = [
+    "crates/cardwire-policy",
     "crates/cardwire-daemon",
     "crates/cardwire-cli",
     "crates/cardwire-ebpf-userspace",

@@ -3,9 +3,10 @@ use crate::{
         dynamic_analysis::{check_env, get_steam_app_id}, helpers::{get_real_process_name, strip_nix_wrap}, static_analysis::{self, AppMetadata, watch_fdo_folders}
     }, file::{DbusAppMetadata, GpuPolicy}, interface::{LogEntry, LoggerInterfaceSignals, SmartPolicyInterface}
 };
-use aya::maps::{HashMap as AyaHashMap, RingBuf};
+use aya::maps::{HashMap as AyaHashMap, MapError, RingBuf};
 use aya_log::EbpfLogger;
 use cardwire_ebpf_userspace::EbpfBlocker;
+use cardwire_policy::ProcessPolicy;
 use log::{Log, debug, error, info, warn};
 use std::{
     collections::{HashMap, HashSet, VecDeque}, fs, ptr, sync::{Arc, OnceLock}, time::SystemTime
@@ -42,8 +43,7 @@ pub struct CardwireAnalyzer {
     exec_ring: Arc<Mutex<AsyncFd<RingBuf<aya::maps::MapData>>>>,
     #[allow(dead_code)]
     report_ring: Arc<Mutex<AsyncFd<RingBuf<aya::maps::MapData>>>>,
-    pid_map: Arc<RwLock<AyaHashMap<aya::maps::MapData, u32, u32>>>,
-    forced_map: Arc<RwLock<AyaHashMap<aya::maps::MapData, u32, u32>>>,
+    process_policies: Arc<RwLock<AyaHashMap<aya::maps::MapData, u32, u64>>>,
     ebpf_logger: Arc<Mutex<AsyncFd<EbpfLogger<&'static dyn Log>>>>,
     xdg_list: Arc<RwLock<HashMap<String, AppMetadata>>>,
     xdg_folders: Vec<std::path::PathBuf>,
@@ -74,8 +74,7 @@ impl CardwireAnalyzer {
         let mut blocker = blocker.write().await;
         let exec_ring = blocker.get_exec_ring()?;
         let report_ring = blocker.get_report_ring()?;
-        let pid_map = Arc::clone(&blocker.pid_map);
-        let forced_map = Arc::clone(&blocker.forced_map);
+        let process_policies = Arc::clone(&blocker.process_policies);
         let ebpf_logger = blocker.get_ebpf_logger()?;
 
         let exec_ring = AsyncFd::new(exec_ring)?;
@@ -96,8 +95,7 @@ impl CardwireAnalyzer {
         Ok(CardwireAnalyzer {
             exec_ring,
             report_ring,
-            pid_map,
-            forced_map,
+            process_policies,
             ebpf_logger,
             xdg_list,
             xdg_folders,
@@ -163,11 +161,11 @@ impl CardwireAnalyzer {
 
     async fn spawn_exec_analyzer(&self, event: ExecEvent) -> () {
         let time = Instant::now();
-        let pid_map = self.pid_map.read().await;
-        if pid_map.get(&event.pid, 0).is_ok() {
+        let policies = self.process_policies.read().await;
+        if policies.get(&event.pid, 0).is_ok() {
             return;
         }
-        drop(pid_map);
+        drop(policies);
         let real_app_name = match get_real_process_name(event.pid) {
             Some(name) => name,
             None => return,
@@ -177,13 +175,10 @@ impl CardwireAnalyzer {
             .await
             && result.0
         {
-            match result.1 {
+            let policy = match result.1 {
                 PidType::Forced => {
                     info!("FORCE: pid: {} process: {} ", event.pid, real_app_name);
-                    let mut forced_map = self.forced_map.write().await;
-                    if let Err(e) = forced_map.insert(event.pid, result.2, 0) {
-                        warn!("Failed to insert into eBPF map: {}", e);
-                    }
+                    ProcessPolicy::Forced(result.2)
                 }
                 PidType::Allowed => {
                     info!(
@@ -192,11 +187,17 @@ impl CardwireAnalyzer {
                         real_app_name,
                         time.elapsed().as_micros()
                     );
-                    let mut pid_map = self.pid_map.write().await;
-                    if let Err(e) = pid_map.insert(event.pid, result.1 as u32, 0) {
-                        warn!("Failed to insert into eBPF map: {}", e);
-                    }
+                    ProcessPolicy::Allowed
                 }
+            };
+            // An explicit API request may have arrived during async analysis.
+            // BPF_NOEXIST makes that administrator decision win atomically.
+            let mut policies = self.process_policies.write().await;
+            if let Err(error) = policies.insert(event.pid, policy.encode(), 1)
+                && !matches!(&error, MapError::SyscallError(e)
+                    if e.call == "bpf_map_update_elem" && e.io_error.kind() == std::io::ErrorKind::AlreadyExists)
+            {
+                warn!("Failed to insert process policy: {}", error);
             }
         }
     }

@@ -1,35 +1,67 @@
 use aya::maps::{HashMap as AyaHashMap, MapError as AyaMapError};
 use cardwire_ebpf_userspace::EbpfBlocker;
+use cardwire_policy::ProcessPolicy;
 use std::{
-    collections::HashMap, io::ErrorKind, path::Path, sync::{Arc, OnceLock}
+    collections::HashMap, path::Path, sync::{Arc, OnceLock}
 };
 
 use tokio::sync::{Mutex, RwLock};
-use zbus::{
-    fdo::{self, Error::Failed}, interface, object_server::SignalEmitter
-};
+use zbus::{Connection, fdo, interface, message::Header, object_server::SignalEmitter};
 
 use crate::file::{CardwireDatabase, DbusAppMetadata, GpuPolicy};
 
-// Removing the opposite policy must also work for an unclassified PID or a repeated request.
-// Aya's hash-map remove reports a missing key as a syscall ENOENT, unlike get (KeyNotFound).
-// Handle the delete result directly: an existence check could race with eBPF exec/exit cleanup.
-fn ignore_missing_pid(err: AyaMapError) -> Result<(), AyaMapError> {
-    match err {
-        AyaMapError::KeyNotFound => Ok(()),
-        AyaMapError::SyscallError(ref err)
-            if err.call == "bpf_map_delete_elem" && err.io_error.kind() == ErrorKind::NotFound =>
-        {
-            Ok(())
-        }
-        _ => Err(err),
+fn require_administrator(uid: Option<u32>) -> fdo::Result<()> {
+    if uid == Some(0) {
+        Ok(())
+    } else {
+        Err(fdo::Error::AccessDenied(
+            "Changing a PID's GPU policy requires root".into(),
+        ))
+    }
+}
+
+async fn authorize_process_request(
+    connection: &Connection,
+    header: &Header<'_>,
+) -> fdo::Result<()> {
+    // The bus supplies the unique sender and authenticates its UID. Never
+    // derive authority from the target PID, client arguments or environment.
+    let sender = header
+        .sender()
+        .ok_or_else(|| fdo::Error::AccessDenied("Missing D-Bus sender".into()))?;
+    let bus = fdo::DBusProxy::new(connection)
+        .await
+        .map_err(|_| fdo::Error::AccessDenied("Cannot authenticate D-Bus caller".into()))?;
+    let uid = bus
+        .get_connection_unix_user(sender.clone().into())
+        .await
+        .map_err(|_| fdo::Error::AccessDenied("Cannot authenticate D-Bus caller".into()))?;
+    require_administrator(Some(uid))
+}
+
+fn requested_policy(policy: &str, value: u32) -> fdo::Result<Option<ProcessPolicy>> {
+    match policy {
+        "Default" => Ok(None),
+        "Allow_dGPU" => Ok(Some(ProcessPolicy::Allowed)),
+        "Force_dGPU" | "Force_GPU" => Ok(Some(ProcessPolicy::Forced(value))),
+        _ => Err(fdo::Error::InvalidArgs(format!("invalid arg: {policy}"))),
+    }
+}
+
+fn policy_status(raw: Option<u64>) -> fdo::Result<(String, Option<u32>)> {
+    match raw {
+        None => Ok((String::new(), None)),
+        Some(raw) => match ProcessPolicy::decode(raw) {
+            Some(ProcessPolicy::Allowed) => Ok(("Allowed".into(), Some(0))),
+            Some(ProcessPolicy::Forced(gpu)) => Ok(("Forced".into(), Some(gpu))),
+            None => Err(fdo::Error::Failed("Invalid process policy encoding".into())),
+        },
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct SmartPolicyInterface {
-    pid_map: Arc<RwLock<AyaHashMap<aya::maps::MapData, u32, u32>>>,
-    forced_map: Arc<RwLock<AyaHashMap<aya::maps::MapData, u32, u32>>>,
+    process_policies: Arc<RwLock<AyaHashMap<aya::maps::MapData, u32, u64>>>,
     pub database: CardwireDatabase,
     policy_lock: Arc<Mutex<()>>,
     pub new_app_signal: Arc<OnceLock<SignalEmitter<'static>>>,
@@ -37,12 +69,8 @@ pub struct SmartPolicyInterface {
 
 impl SmartPolicyInterface {
     pub fn build(blocker: &mut EbpfBlocker, db: CardwireDatabase) -> Self {
-        let pid_map = Arc::clone(&blocker.pid_map);
-        let forced_map = Arc::clone(&blocker.forced_map);
-
         Self {
-            pid_map,
-            forced_map,
+            process_policies: Arc::clone(&blocker.process_policies),
             database: db,
             policy_lock: Arc::new(Mutex::new(())),
             new_app_signal: Arc::new(OnceLock::new()),
@@ -52,7 +80,7 @@ impl SmartPolicyInterface {
 
 #[interface(name = "org.opengamingcollective.cardwire.SmartPolicy")]
 impl SmartPolicyInterface {
-    /// Authorized a pid to access a specific GPU
+    /// Administratively authorize a PID to access a specific GPU (root only).
     /// policy should be:
     ///     Default (does nothing)
     ///     Allow_dGPU
@@ -66,108 +94,37 @@ impl SmartPolicyInterface {
         pid: u32,
         policy: String,
         value: u32,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
     ) -> Result<(), fdo::Error> {
+        authorize_process_request(connection, &header).await?;
         // Check if the process exists, leave if it doesnt
         if !Path::new(&format!("/proc/{}", pid)).exists() {
             return Err(fdo::Error::Failed("process doesn't exist".to_string()));
         }
-        // Match the policy and add the pid to the corresponding ebpf map
-        match policy.as_str() {
-            // Default, do nothing
-            "Default" => Ok(()),
-            // Equivalent to CARDWIRE_ALLOW=1, show both iGPU and dGPU
-            "Allow_dGPU" => {
-                {
-                    // First remove the PID from the other map if present
-                    let mut forced_map = self.forced_map.write().await;
-                    forced_map
-                        .remove(&pid)
-                        .or_else(ignore_missing_pid)
-                        .map_err(|err| fdo::Error::Failed(err.to_string()))?;
-                }
-                let mut pid_map = self.pid_map.write().await;
-                pid_map
-                    .insert(pid, 0, 0)
-                    .map_err(|err| fdo::Error::Failed(err.to_string()))
-            }
-            // Equivalent to CARDWIRE_FORCE_DGPU=value
-            "Force_dGPU" => {
-                {
-                    // First remove the PID from the other map if present
-                    let mut pid_map = self.pid_map.write().await;
-                    pid_map
-                        .remove(&pid)
-                        .or_else(ignore_missing_pid)
-                        .map_err(|err| fdo::Error::Failed(err.to_string()))?;
-                }
-                let mut force_map = self.forced_map.write().await;
-                force_map
-                    .insert(pid, value, 0)
-                    .map_err(|err| Failed(err.to_string()))
-            }
-            // Equivalent to CARDWIRE_FORCE_GPU=value
-            "Force_GPU" => {
-                {
-                    // First remove the PID from the other map if present
-                    let mut pid_map = self.pid_map.write().await;
-                    pid_map
-                        .remove(&pid)
-                        .or_else(ignore_missing_pid)
-                        .map_err(|err| fdo::Error::Failed(err.to_string()))?;
-                }
-                let mut force_map = self.forced_map.write().await;
-                force_map
-                    .insert(pid, value, 0)
-                    .map_err(|err| Failed(err.to_string()))
-            }
-            _ => Err(fdo::Error::InvalidArgs(format!("invalid arg: {}", policy))),
-        }
+        let Some(policy) = requested_policy(&policy, value)? else {
+            return Ok(());
+        };
+        // A single BPF_ANY update is the complete transition. Concurrent API,
+        // analyzer and exec/exit cleanup operations cannot create a dual state.
+        // If update fails, the old policy remains; no delete or rollback needed.
+        self.process_policies
+            .write()
+            .await
+            .insert(pid, policy.encode(), 0)
+            .map_err(|err| fdo::Error::Failed(err.to_string()))
     }
 
-    /// Check if the process is inside PID or FORCED map
+    /// Read the same single policy value used by eBPF enforcement.
     /// Return the map type with the gpu_id associed
     pub async fn get_process_status(&self, pid: u32) -> Result<(String, Option<u32>), fdo::Error> {
-        let mut status = String::new();
-        let mut gpu_id: Option<u32> = None;
-
-        {
-            let pid_map = self.pid_map.read().await;
-            match pid_map.get(&pid, 0) {
-                Ok(id) => {
-                    status = "Allowed".to_string();
-                    gpu_id = Some(id)
-                }
-                Err(err) => match err {
-                    AyaMapError::KeyNotFound => {}
-                    _ => {
-                        return Err(fdo::Error::Failed(format!(
-                            "Couldn't read PID MAP: {}",
-                            err
-                        )));
-                    }
-                },
-            }
+        match self.process_policies.read().await.get(&pid, 0) {
+            Ok(raw) => policy_status(Some(raw)),
+            Err(AyaMapError::KeyNotFound) => policy_status(None),
+            Err(err) => Err(fdo::Error::Failed(format!(
+                "Couldn't read process policy: {err}"
+            ))),
         }
-        {
-            let forced_map = self.forced_map.read().await;
-            match forced_map.get(&pid, 0) {
-                Ok(id) => {
-                    status = "Forced".to_string();
-                    gpu_id = Some(id)
-                }
-                Err(err) => match err {
-                    AyaMapError::KeyNotFound => {}
-                    _ => {
-                        return Err(fdo::Error::Failed(format!(
-                            "Couldn't read FORCED MAP: {}",
-                            err
-                        )));
-                    }
-                },
-            }
-        }
-
-        Ok((status, gpu_id))
     }
 
     /// Get the list of app inside the internal cardwire database
@@ -219,74 +176,64 @@ impl SmartPolicyInterface {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
-
-    use aya::sys::SyscallError;
-
     use super::*;
 
-    fn syscall_error(call: &'static str, errno: i32) -> AyaMapError {
-        AyaMapError::SyscallError(SyscallError {
-            call,
-            io_error: io::Error::from_raw_os_error(errno),
-        })
-    }
-
     #[test]
-    fn successful_delete_stays_successful() {
-        let result: Result<(), AyaMapError> = Ok(());
-        assert!(result.or_else(ignore_missing_pid).is_ok());
-    }
-
-    #[test]
-    fn missing_pid_delete_is_successful() {
-        // Linux ENOENT: the error returned by Aya HashMap::remove for a fresh PID,
-        // a repeated policy, or a PID already removed by the eBPF cleanup hooks.
-        let result = Err(syscall_error("bpf_map_delete_elem", 2));
-        assert!(result.or_else(ignore_missing_pid).is_ok());
-    }
-
-    #[test]
-    fn key_not_found_is_successful() {
-        assert!(ignore_missing_pid(AyaMapError::KeyNotFound).is_ok());
-    }
-
-    #[test]
-    fn other_delete_errors_are_preserved() {
-        // Linux EPERM, EBADF, ENOMEM, EACCES and EINVAL must not be treated as a missing PID.
-        for errno in [1, 9, 12, 13, 22] {
-            let err = syscall_error("bpf_map_delete_elem", errno);
+    fn process_mutation_requires_authenticated_root() {
+        assert!(require_administrator(Some(0)).is_ok());
+        for uid in [None, Some(1), Some(1000), Some(u32::MAX)] {
             assert!(matches!(
-                ignore_missing_pid(err),
-                Err(AyaMapError::SyscallError(err))
-                    if err.call == "bpf_map_delete_elem"
-                        && err.io_error.raw_os_error() == Some(errno)
+                require_administrator(uid),
+                Err(fdo::Error::AccessDenied(_))
             ));
         }
     }
 
     #[test]
-    fn missing_key_from_other_syscalls_is_not_ignored() {
-        let err = syscall_error("bpf_map_update_elem", 2);
+    fn request_values_keep_the_existing_wire_semantics() {
+        assert_eq!(requested_policy("Default", 1).unwrap(), None);
+        assert_eq!(
+            requested_policy("Allow_dGPU", 0).unwrap(),
+            Some(ProcessPolicy::Allowed)
+        );
+        assert_eq!(
+            requested_policy("Allow_dGPU", 1).unwrap(),
+            Some(ProcessPolicy::Allowed)
+        );
+        assert_eq!(
+            requested_policy("Force_dGPU", 0).unwrap(),
+            Some(ProcessPolicy::Forced(0))
+        );
+        assert_eq!(
+            requested_policy("Force_GPU", 15).unwrap(),
+            Some(ProcessPolicy::Forced(15))
+        );
         assert!(matches!(
-            ignore_missing_pid(err),
-            Err(AyaMapError::SyscallError(err))
-                if err.call == "bpf_map_update_elem" && err.io_error.raw_os_error() == Some(2)
+            requested_policy("unknown", 0),
+            Err(fdo::Error::InvalidArgs(_))
         ));
     }
 
     #[test]
-    fn map_validation_errors_are_preserved() {
-        let err = AyaMapError::InvalidKeySize {
-            size: 8,
-            expected: 4,
-        };
+    fn status_decodes_the_same_value_as_enforcement() {
+        assert_eq!(policy_status(None).unwrap(), (String::new(), None));
+        assert_eq!(
+            policy_status(Some(ProcessPolicy::Allowed.encode())).unwrap(),
+            ("Allowed".into(), Some(0))
+        );
+        for gpu in [0, 1, 15, u32::MAX] {
+            assert_eq!(
+                policy_status(Some(ProcessPolicy::Forced(gpu).encode())).unwrap(),
+                ("Forced".into(), Some(gpu))
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_map_value_is_not_reported_as_unclassified() {
         assert!(matches!(
-            ignore_missing_pid(err),
-            Err(AyaMapError::InvalidKeySize {
-                size: 8,
-                expected: 4
-            })
+            policy_status(Some(u64::MAX)),
+            Err(fdo::Error::Failed(_))
         ));
     }
 }

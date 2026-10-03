@@ -9,7 +9,7 @@ use aya_log_ebpf::{error, warn};
 use crate::{
     helpers::{
         MAX_DIRENTS, ScanCtx, get_dentry_inode, get_dentry_name, is_cardwired, is_comm_whitelisted, is_hybrid, is_inode_blocked, is_manual, is_smart, scan_dirent
-    }, maps::{CW_ALLOWED_PID, CW_DIRENT, CW_EXEC_EVENTS, CW_FORCED_PID, ExecEvent}, models::{InodeKey, ReturnCode, ScanCode}, vmlinux::{dentry, file, inode, path}
+    }, maps::{CW_DIRENT, CW_EXEC_EVENTS, CW_PID_POLICY, ExecEvent}, models::{InodeKey, ReturnCode, ScanCode}, vmlinux::{dentry, file, inode, path}
 };
 
 #[allow(
@@ -429,8 +429,7 @@ pub fn tracepoint_sched_process_exec(ctx: TracePointContext) -> u32 {
 unsafe fn try_tracepoint_sched_process_exec(ctx: TracePointContext) -> Result<i32, i32> {
     // First we clean the MAP
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let _ = CW_ALLOWED_PID.remove(&pid);
-    let _ = CW_FORCED_PID.remove(&pid);
+    let _ = CW_PID_POLICY.remove(&pid);
     // If it's the daemon, we must exit
     match is_cardwired() {
         Some(res) => {
@@ -502,9 +501,8 @@ unsafe fn try_tracepoint_sched_process_exit(_ctx: TracePointContext) -> Result<i
     if pid != tgid {
         return ReturnCode::SUCCESS;
     }
-    // Remove PID from the maps
-    let _ = CW_ALLOWED_PID.remove(&pid);
-    let _ = CW_FORCED_PID.remove(&pid);
+    // Remove the complete policy with one operation.
+    let _ = CW_PID_POLICY.remove(&pid);
 
     ReturnCode::SUCCESS
 }

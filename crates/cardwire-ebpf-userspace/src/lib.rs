@@ -19,8 +19,7 @@ pub enum EbpfSettings {
 
 pub struct EbpfBlocker {
     ebpf: Ebpf,
-    pub pid_map: Arc<RwLock<HashMap<aya::maps::MapData, u32, u32>>>,
-    pub forced_map: Arc<RwLock<HashMap<aya::maps::MapData, u32, u32>>>,
+    pub process_policies: Arc<RwLock<HashMap<aya::maps::MapData, u32, u64>>>,
     pushed_exp_inodes: Vec<InodeKey>,
 }
 
@@ -197,16 +196,11 @@ impl EbpfBlocker {
             };
         }
 
-        let pid_map = Self::get_pid_map(&mut ebpf)?;
-        let forced_map = Self::get_forced_pid_map(&mut ebpf)?;
-
-        let pid_map = Arc::new(RwLock::new(pid_map));
-        let forced_map = Arc::new(RwLock::new(forced_map));
+        let process_policies = Arc::new(RwLock::new(Self::get_process_policies(&mut ebpf)?));
 
         Ok(Self {
             ebpf,
-            pid_map,
-            forced_map,
+            process_policies,
             pushed_exp_inodes: Vec::new(),
         })
     }
@@ -452,11 +446,11 @@ impl EbpfBlocker {
         Ok(ring_buf)
     }
 
-    /// take the CW_ALLOWED_PID HashMap map from the blocker
-    pub fn get_pid_map(
+    /// Take the single authoritative per-PID policy map.
+    pub fn get_process_policies(
         ebpf: &mut Ebpf,
-    ) -> CardwireEbpfResult<HashMap<aya::maps::MapData, u32, u32>> {
-        let map_str = "CW_ALLOWED_PID";
+    ) -> CardwireEbpfResult<HashMap<aya::maps::MapData, u32, u64>> {
+        let map_str = "CW_PID_POLICY";
         let map = match ebpf.take_map(map_str) {
             Some(map) => map,
             None => {
@@ -466,34 +460,10 @@ impl EbpfBlocker {
                 });
             }
         };
-        let map: HashMap<aya::maps::MapData, u32, u32> = match HashMap::try_from(map) {
+        let map: HashMap<aya::maps::MapData, u32, u64> = match HashMap::try_from(map) {
             Ok(map) => map,
             Err(err) => {
-                error!("error while trying to get the allowed_pid map");
-                return Err(CardwireEbpfError::aya(err));
-            }
-        };
-        Ok(map)
-    }
-
-    /// take the CW_FORCED_PID HashMap map from the blocker
-    pub fn get_forced_pid_map(
-        ebpf: &mut Ebpf,
-    ) -> CardwireEbpfResult<HashMap<aya::maps::MapData, u32, u32>> {
-        let map_str = "CW_FORCED_PID";
-        let map = match ebpf.take_map(map_str) {
-            Some(map) => map,
-            None => {
-                error!("error while trying to take map {}", map_str);
-                return Err(CardwireEbpfError::MissingMap {
-                    name: map_str.to_string(),
-                });
-            }
-        };
-        let map: HashMap<aya::maps::MapData, u32, u32> = match HashMap::try_from(map) {
-            Ok(map) => map,
-            Err(err) => {
-                error!("error while trying to get the forced_pid map");
+                error!("error while trying to get the process policy map");
                 return Err(CardwireEbpfError::aya(err));
             }
         };

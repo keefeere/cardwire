@@ -65,6 +65,7 @@ in
       };
       networking.useDHCP = false;
       networking.interfaces = lib.mkForce { };
+      users.users.alice.isNormalUser = true;
     };
 
   testScript = ''
@@ -112,7 +113,7 @@ in
         "org.opengamingcollective.cardwire.SmartPolicy "
       )
       # Hybrid mode leaves these PIDs unclassified. Use a new process for each
-      # initial policy so every branch is tested against two empty policy maps.
+      # initial policy so every branch is tested against an empty PID entry.
       for index, initial in enumerate(["Allow_dGPU", "Force_dGPU", "Force_GPU"]):
         unit = f"cardwire-process-policy-{index}.service"
         machine.succeed(f"systemd-run --unit={unit} --property=Type=exec sleep infinity")
@@ -141,6 +142,9 @@ in
           t.assertEqual(status["data"], ["Allowed", [0]])
         finally:
           machine.succeed(f"systemctl stop {unit}")
+
+    with subtest("PID authorization and concurrent policy enforcement"):
+      machine.succeed("${(pkgs system).python3}/bin/python3 ${./process-policy-test.py} --test-vm-only", timeout=180)
 
     with subtest("Try to block default gpu"):
       t.assertIn("Per GPU block is only available on manual mode", machine.fail("cardwire gpu 0 --block 2>&1"), "Default gpu got blocked")

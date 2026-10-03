@@ -768,6 +768,7 @@ dependencies = [
  "aya",
  "aya-log",
  "cardwire-ebpf-userspace",
+ "cardwire-policy",
  "env_logger",
  "freedesktop-desktop-entry",
  "inotify",
@@ -792,6 +793,7 @@ version = "0.12.3"
 dependencies = [
  "aya-ebpf",
  "aya-log-ebpf",
+ "cardwire-policy",
  "which",
 ]
 
@@ -833,6 +835,10 @@ dependencies = [
  "xdg",
  "zbus",
 ]
+
+[[package]]
+name = "cardwire-policy"
+version = "0.12.3"
 
 [[package]]
 name = "cargo-platform"

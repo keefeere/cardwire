@@ -65,23 +65,10 @@ pub static CW_BLOCKED_INO: HashMap<InodeKey, InodeState> =
 pub static CW_EXP_BLK_INO: HashMap<InodeKey, u32> =
     HashMap::<InodeKey, u32>::with_max_entries(4096, 0);
 
-/*
-    Map used to store a list of allowed pid
-    Key = PID
-    Value = always 0
-*/
+// One atomic value per PID, encoded by cardwire-policy. Keep the combined
+// capacity of the former 16K Allow and 16K Force maps.
 #[map]
-pub static CW_ALLOWED_PID: HashMap<u32, u32> = HashMap::<u32, u32>::with_max_entries(16384, 0);
-
-/*
-    Map used to store a list of forced pid (CARDWIRE_FORCE_GPU)
-    The value is used to identify a GPU, the process will only be able to see blocked_ino that matchs
-    If it doesnt match, the process wont be able to see the said ino
-    Key = PID
-    Value = GPU id
-*/
-#[map]
-pub static CW_FORCED_PID: HashMap<u32, u32> = HashMap::<u32, u32>::with_max_entries(16384, 0);
+pub static CW_PID_POLICY: HashMap<u32, u64> = HashMap::<u32, u64>::with_max_entries(32768, 0);
 
 /*
     Map used to store a list of whitelist comm, some comm needs to have access to the GPUs, preventing that access can cause crash or instability

@@ -1,10 +1,11 @@
 use aya_ebpf::helpers::{
     bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_probe_read_user, bpf_probe_read_user_str_bytes, bpf_probe_write_user, generated::bpf_get_current_task
 };
+use cardwire_policy::ProcessPolicy;
 
 use crate::{
     CardwiredSetting, DAEMON_INDEX, HYBRID, INTEGRATED, MANUAL, MODE_INDEX, SMART, maps::{
-        CW_ALLOWED_COMM, CW_ALLOWED_PID, CW_BLOCKED_INO, CW_DAEMON_PID, CW_EXP_BLK_INO, CW_FORCED_PID, CW_MODE, CW_REPORT_EVENTS, CW_SETTINGS, InodeKey, ReportEvent
+        CW_ALLOWED_COMM, CW_BLOCKED_INO, CW_DAEMON_PID, CW_EXP_BLK_INO, CW_MODE, CW_PID_POLICY, CW_REPORT_EVENTS, CW_SETTINGS, InodeKey, ReportEvent
     }
 };
 
@@ -137,13 +138,12 @@ pub unsafe fn is_inode_blocked(key: InodeKey) -> bool {
         if *mode == MANUAL {
             let ppid = get_task_ppid().unwrap_or(u32::MAX);
 
-            // Check if the PID or PPID is in the forced map
-            let forced_gpu_id =
-                unsafe { CW_FORCED_PID.get(pid).or_else(|| CW_FORCED_PID.get(ppid)) };
-
-            if let Some(pid_gpu_id) = forced_gpu_id {
+            let own = unsafe { CW_PID_POLICY.get(pid).copied() }.and_then(ProcessPolicy::decode);
+            let parent =
+                unsafe { CW_PID_POLICY.get(ppid).copied() }.and_then(ProcessPolicy::decode);
+            if let Some(ProcessPolicy::Forced(pid_gpu_id)) = ProcessPolicy::manual(own, parent) {
                 // If forced GPU ID matches the inode's GPU ID, allow access
-                match *pid_gpu_id == ino_gpu_id {
+                match pid_gpu_id == ino_gpu_id {
                     true => break 'end,
                     false => {
                         report_event(pid, ino_gpu_id, comm);
@@ -166,27 +166,20 @@ pub unsafe fn is_inode_blocked(key: InodeKey) -> bool {
         if *mode == SMART {
             let ppid = get_task_ppid().unwrap_or(u32::MAX);
 
-            // We need to check if the map contains the pid
-            // In smart mode, we do not check if the ino_gpu_id matches, it was only made for dual
-            // gpu(hybrid) laptops
-
-            // First we try with the pid
-            if unsafe { CW_ALLOWED_PID.get(pid).is_some() }
-                || unsafe { CW_ALLOWED_PID.get(ppid).is_some() }
-            {
-                // We got a match, pid is allowed !
+            // Copy each complete value once: concurrent replacement cannot
+            // make this lookup observe both an Allow and a Force for one PID.
+            let own = unsafe { CW_PID_POLICY.get(pid).copied() }.and_then(ProcessPolicy::decode);
+            let parent =
+                unsafe { CW_PID_POLICY.get(ppid).copied() }.and_then(ProcessPolicy::decode);
+            let policy = ProcessPolicy::smart(own, parent);
+            if policy == Some(ProcessPolicy::Allowed) {
                 break 'end;
             }
-
-            // If we are here, the pid AND the ppid are not in the allowed map, check the FORCED map
-            let forced_gpu_id =
-                unsafe { CW_FORCED_PID.get(pid).or_else(|| CW_FORCED_PID.get(ppid)) };
-
-            if let Some(pid_gpu_id) = forced_gpu_id {
+            if let Some(ProcessPolicy::Forced(pid_gpu_id)) = policy {
                 // We match the ino_gpu_id with the pid_gpu_id
                 // If they match, that means the ino is owned by the said GPU id, and we want to
                 // force the process to use said GPU id
-                match *pid_gpu_id == ino_gpu_id {
+                match pid_gpu_id == ino_gpu_id {
                     // The process should be allowed to see the inode
                     true => break 'end,
                     // Process should only be allowed to see the said GPU id

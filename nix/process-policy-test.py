@@ -22,10 +22,13 @@ def call(method, *args, user=None, denied=False):
     command = API + [method] + [str(arg) for arg in args]
     if user:
         command = ["runuser", "-u", user, "--"] + command
-    result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+    result = subprocess.run(command, capture_output=True, text=True, timeout=15,
+                            env={**os.environ, "LC_ALL": "C"})
     if denied:
         assert result.returncode != 0, result
-        assert "requires root" in result.stderr, result.stderr
+        # zbus/busctl expose the standard AccessDenied description, not the
+        # explanatory string carried inside the Rust fdo::Error variant.
+        assert result.stderr.strip() == "Call failed: Access denied", result.stderr
         return
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)["data"] if result.stdout.strip() else None

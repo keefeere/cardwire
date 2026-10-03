@@ -69,6 +69,8 @@ in
     };
 
   testScript = ''
+    import json
+
     machine.start()
     machine.wait_for_unit("default.target")
     with subtest("Wait for boot and services"):

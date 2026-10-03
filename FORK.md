@@ -62,10 +62,11 @@ These are isolated virtual-GPU tests, not proof of NVIDIA/USB4 hardware behavior
 
 ## Deployment boundary
 
-The main development line is currently **0.13.0-alpha.1**. Do not silently replace
-a Bazzite 0.12.3 installation with this bundle. The `backport/v0.12.3-process-access`
-branch originally contains only the earlier idempotence fix, not this security
-patch. Check its history before using it.
+This branch, `backport/v0.12.3-secure-policy`, applies the security and atomic
+policy changes to **0.12.3**, without importing the 0.13 alpha feature changes.
+The main development line is separately based on 0.13.0-alpha.1. The older
+`backport/v0.12.3-process-access` branch contains only the earlier idempotence
+fix. Check the source commit and branch before using a build.
 
 The bundle is not an RPM or a self-contained static distribution: it needs the
 usual host graphics libraries, system-bus policy and service configuration.

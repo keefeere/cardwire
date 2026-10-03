@@ -15,6 +15,7 @@ concurrency:
 jobs:
   # Build job
   build:
+    if: github.repository == 'OpenGamingCollective/cardwire'
     runs-on: ubuntu-latest
     env:
       MDBOOK_VERSION: 0.5.2

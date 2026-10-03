@@ -1,0 +1,80 @@
+name: Fork build and tests
+
+on:
+  push:
+    branches: [main, 'fork/**', 'backport/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.repository == 'keefeere/cardwire'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libbpf-dev libudev-dev pkg-config gcc-multilib \
+            libegl1-mesa-dev libvulkan-dev libglvnd-dev libwayland-dev \
+            libxkbcommon-dev libx11-dev libxcb1-dev libx11-xcb-dev
+      - name: Install pinned eBPF and formatting toolchain
+        uses: dtolnay/rust-toolchain@eac0f66a48bc4b70a10b9acd4c4e930f835d95ff
+        with:
+          toolchain: nightly-2026-08-12
+          components: rust-src,rustfmt
+      - name: Install pinned userspace toolchain
+        uses: dtolnay/rust-toolchain@eac0f66a48bc4b70a10b9acd4c4e930f835d95ff # 1.95.0
+        with:
+          toolchain: 1.95.0
+          components: clippy
+      - uses: cargo-bins/cargo-binstall@422f3094be6a0843857aa008b499caaf6bce0da8 # v1.24.0
+        with:
+          version: '1.21.1'
+      - name: Install pinned eBPF linker
+        run: cargo binstall --version 0.11.0 --locked --no-confirm bpf-linker
+      - name: Formatting
+        run: cargo +nightly-2026-08-12 fmt --all --check
+      - name: Unit tests
+        run: cargo +1.95.0 test --locked
+      - name: Clippy
+        run: cargo +1.95.0 clippy --locked --all-targets --all-features -- -D warnings
+      - name: Build daemon, CLI and GUI from this commit
+        run: cargo +1.95.0 build --locked --release --config profile.release.lto=false
+      - name: Bundle binaries and source provenance
+        run: bash scripts/fork-bundle.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cardwire-linux-x86_64-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  vm:
+    if: github.repository == 'keefeere/cardwire'
+    name: eBPF VM (${{ matrix.vm }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        vm: [vm-ci-2gpu, vm-ci-3gpu, vm-ci-15gpu]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: determinateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - name: Test in isolated QEMU guests
+        run: nix build --no-link --print-build-logs .#checks.x86_64-linux.${{ matrix.vm }}

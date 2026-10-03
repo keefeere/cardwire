@@ -3,8 +3,8 @@ set -euo pipefail
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 revision=$(git rev-parse HEAD)
-[[ -z $(git status --porcelain --untracked-files=no) ]] || {
-    echo 'Refusing to label a dirty tracked checkout with a clean commit ID.' >&2
+[[ -z $(git status --porcelain) ]] || {
+    echo 'Refusing to label a dirty checkout with a clean commit ID.' >&2
     exit 1
 }
 bundle_name="cardwire-linux-x86_64-${revision}"

@@ -865,6 +865,14 @@ impl PersistentGuard {
             .collect()
     }
 
+    /// Live registrations as (incarnation, cgroup id, executable inode, uid), catalog order.
+    pub fn role_identities(&self) -> Vec<(u64, u64, u64, u32)> {
+        self.current.roles[..self.role_count()]
+            .iter()
+            .map(|r| (r.incarnation, r.cgroup_id, r.executable_inode, r.uid))
+            .collect()
+    }
+
     /// Devices any process may open (non-role processes included).
     pub fn default_mask(&self) -> u32 {
         self.current.default_mask

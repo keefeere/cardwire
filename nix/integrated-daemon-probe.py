@@ -247,7 +247,11 @@ def main():
         assert r.returncode == 0, r
         long_open(running, 0)
         spawn(outside, -13)
-        print('PASS: AdmitProcess adopts the running matching process only (root-only, identity checked)', flush=True)
+        roles = busctl('get-property', 'org.opengamingcollective.cardwire', '/org/opengamingcollective/cardwire',
+                       'org.opengamingcollective.cardwire.ServiceRoles', 'Roles')
+        words = roles.stdout.split()
+        assert roles.returncode == 0 and words[:2] == ['a(tttu)', '1'] and int(words[3]) == cg2.stat().st_ino, roles
+        print('PASS: AdmitProcess adopts the running matching process only (root-only, identity checked); Roles property live', flush=True)
 
         control('kill', '--kill-whom=main', '--signal=KILL', unit)
         spawn(cg2, 0)

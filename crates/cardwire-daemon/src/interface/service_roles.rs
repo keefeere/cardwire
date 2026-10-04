@@ -38,6 +38,16 @@ impl ServiceRolesInterface {
         Ok(guard.permissions())
     }
 
+    /// Registered roles as (incarnation, cgroup id, executable inode, uid), catalog order.
+    #[zbus(property)]
+    fn roles(&self) -> fdo::Result<Vec<(u64, u64, u64, u32)>> {
+        let guard = owner()?;
+        let guard = guard
+            .lock()
+            .map_err(|_| fdo::Error::Failed("owner poisoned".into()))?;
+        Ok(guard.role_identities())
+    }
+
     /// Devices any process may open, with or without an admitted role.
     #[zbus(property)]
     fn default_mask(&self) -> fdo::Result<u32> {

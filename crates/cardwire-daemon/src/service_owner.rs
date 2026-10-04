@@ -72,6 +72,10 @@ pub struct ServiceRolesConfig {
     pub roles: Vec<RoleConfig>,
     #[serde(default, rename = "profile")]
     pub profiles: Vec<ProfileConfig>,
+    /// Applied once, right after the guard is CREATED (never on adoption), so the
+    /// daemon's own device probing is not caught in the initial deny-all window.
+    #[serde(default)]
+    pub initial_profile: Option<String>,
 }
 
 fn default_unit() -> String {
@@ -137,6 +141,12 @@ impl ServiceRolesConfig {
                 u64::from(profile.default_mask) & !valid_bits == 0,
                 "profile {} default_mask names unknown devices",
                 profile.name
+            );
+        }
+        if let Some(initial) = &self.initial_profile {
+            ensure!(
+                self.profiles.iter().any(|p| &p.name == initial),
+                "initial_profile is not a configured profile"
             );
         }
         ensure!(
@@ -205,7 +215,18 @@ fn build(
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        PersistentGuard::create(&config.bpf_object, devices, roles, &config.pin_dir, &owner)?
+        let mut guard =
+            PersistentGuard::create(&config.bpf_object, devices, roles, &config.pin_dir, &owner)?;
+        if let Some(initial) = &config.initial_profile {
+            let profile = config
+                .profiles
+                .iter()
+                .find(|p| &p.name == initial)
+                .context("initial profile vanished")?;
+            let prepared = guard.prepare_policy(&profile.permissions, profile.default_mask)?;
+            guard.commit(prepared)?;
+        }
+        guard
     } else {
         let devices = config
             .devices
@@ -390,6 +411,25 @@ permissions = [60, 0]
         let bad =
             format!("{GOOD}\n[[profile]]\nname = \"g\"\npermissions = [0]\ndefault_mask = 4\n");
         assert!(ServiceRolesConfig::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn initial_profile_must_exist() {
+        // Top-level keys must precede the first table.
+        let with = |name: &str| {
+            GOOD.replace(
+                "enabled = true",
+                &format!("enabled = true\ninitial_profile = \"{name}\""),
+            ) + "\n[[profile]]\nname = \"g\"\npermissions = [0]\n"
+        };
+        assert_eq!(
+            ServiceRolesConfig::parse(&with("g"))
+                .unwrap()
+                .initial_profile
+                .as_deref(),
+            Some("g")
+        );
+        assert!(ServiceRolesConfig::parse(&with("nope")).is_err());
     }
 
     #[test]

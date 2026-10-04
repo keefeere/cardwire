@@ -119,6 +119,12 @@
         machine.fail(f": < /dev/dri/card{cardid}")
       machine.succeed(": < /dev/dri/renderD128")
       machine.succeed(": < /dev/dri/card0")
+
+    with subtest("Kernel layout probes remain healthy"):
+      machine.succeed("journalctl --sync")
+      journal = machine.succeed("journalctl -b -u cardwired.service --no-pager")
+      t.assertNotIn("could not read", journal)
+      t.assertIn("Kernel file layout from BTF", journal)
   '';
 
 }

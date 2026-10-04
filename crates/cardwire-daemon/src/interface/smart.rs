@@ -10,17 +10,17 @@ use zbus::{Connection, fdo, interface, message::Header, object_server::SignalEmi
 
 use crate::file::{CardwireDatabase, DbusAppMetadata, GpuPolicy};
 
-fn require_administrator(uid: Option<u32>) -> fdo::Result<()> {
+pub(super) fn require_administrator(uid: Option<u32>) -> fdo::Result<()> {
     if uid == Some(0) {
         Ok(())
     } else {
         Err(fdo::Error::AccessDenied(
-            "Changing a PID's GPU policy requires root".into(),
+            "This operation requires root".into(),
         ))
     }
 }
 
-async fn authorize_process_request(
+pub(super) async fn authorize_process_request(
     connection: &Connection,
     header: &Header<'_>,
 ) -> fdo::Result<()> {
@@ -43,6 +43,7 @@ fn requested_policy(policy: &str, value: u32) -> fdo::Result<Option<ProcessPolic
     match policy {
         "Default" => Ok(None),
         "Allow_dGPU" => Ok(Some(ProcessPolicy::Allowed)),
+        "Allow_dGPU_Exact" if value == 1 => Ok(Some(ProcessPolicy::AllowedExact)),
         "Force_dGPU" | "Force_GPU" => Ok(Some(ProcessPolicy::Forced(value))),
         _ => Err(fdo::Error::InvalidArgs(format!("invalid arg: {policy}"))),
     }
@@ -53,6 +54,7 @@ fn policy_status(raw: Option<u64>) -> fdo::Result<(String, Option<u32>)> {
         None => Ok((String::new(), None)),
         Some(raw) => match ProcessPolicy::decode(raw) {
             Some(ProcessPolicy::Allowed) => Ok(("Allowed".into(), Some(0))),
+            Some(ProcessPolicy::AllowedExact) => Ok(("AllowedExact".into(), Some(0))),
             Some(ProcessPolicy::Forced(gpu)) => Ok(("Forced".into(), Some(gpu))),
             None => Err(fdo::Error::Failed("Invalid process policy encoding".into())),
         },
@@ -84,11 +86,13 @@ impl SmartPolicyInterface {
     /// policy should be:
     ///     Default (does nothing)
     ///     Allow_dGPU
+    ///     Allow_dGPU_Exact (Smart: this process only, no parent inheritance)
     ///     Force_dGPU
     ///     Force_GPU
     /// value:
     /// if allow/force dGPU: use 0 or 1 (bool)
     /// if Force_GPU: use the target GPU id
+    /// if Allow_dGPU_Exact: must be 1 (not a revoke operation)
     pub async fn request_process_access(
         &self,
         pid: u32,
@@ -221,6 +225,10 @@ mod tests {
             policy_status(Some(ProcessPolicy::Allowed.encode())).unwrap(),
             ("Allowed".into(), Some(0))
         );
+        assert_eq!(
+            policy_status(Some(ProcessPolicy::AllowedExact.encode())).unwrap(),
+            ("AllowedExact".into(), Some(0))
+        );
         for gpu in [0, 1, 15, u32::MAX] {
             assert_eq!(
                 policy_status(Some(ProcessPolicy::Forced(gpu).encode())).unwrap(),
@@ -235,5 +243,19 @@ mod tests {
             policy_status(Some(u64::MAX)),
             Err(fdo::Error::Failed(_))
         ));
+    }
+
+    #[test]
+    fn exact_allow_is_explicit_and_cannot_be_mistaken_for_revoke() {
+        assert_eq!(
+            requested_policy("Allow_dGPU_Exact", 1).unwrap(),
+            Some(ProcessPolicy::AllowedExact)
+        );
+        for value in [0, 2, u32::MAX] {
+            assert!(matches!(
+                requested_policy("Allow_dGPU_Exact", value),
+                Err(fdo::Error::InvalidArgs(_))
+            ));
+        }
     }
 }

@@ -1,6 +1,15 @@
 use aya_ebpf::{
     btf_maps::RingBuf, macros::{btf_map, map}, maps::{Array, HashMap}
 };
+use cardwire_policy::{FileLayout, TaskLayout};
+
+// Set once by the loader, from the running kernel's BTF, before hook attachment.
+// Zero/uninitialized entries are explicitly rejected by the eBPF reader.
+#[map]
+pub static CW_TASK_LAYOUT: Array<TaskLayout> = Array::<TaskLayout>::with_max_entries(1, 0);
+
+#[map]
+pub static CW_FILE_LAYOUT: Array<FileLayout> = Array::<FileLayout>::with_max_entries(1, 0);
 
 /*
     A single entry array used to store cardwired pid

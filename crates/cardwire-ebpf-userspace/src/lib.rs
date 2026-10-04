@@ -1,5 +1,9 @@
 //! main lib code of cardwire-ebpf
 mod errors;
+pub mod fdstore;
+mod kernel_layout;
+#[cfg(feature = "experimental-service-roles")]
+pub mod service_guard;
 
 use std::{fs, path::Path, sync::Arc};
 
@@ -8,6 +12,7 @@ use aya::{
     Btf, Ebpf, maps::{Array, HashMap, MapError, RingBuf}, programs::{Lsm, TracePoint}
 };
 use aya_log::EbpfLogger;
+use cardwire_policy::{FileLayout, TaskLayout};
 use log::{Log, error, info, warn};
 use tokio::{
     io::{Interest, unix::AsyncFd}, sync::RwLock
@@ -16,6 +21,18 @@ use tokio::{
 pub enum EbpfSettings {
     ExperimentalNvidia,
 }
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct TaskLayoutPod(TaskLayout);
+// TaskLayout consists of three u32 fields with no padding or invalid bit patterns.
+unsafe impl aya::Pod for TaskLayoutPod {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct FileLayoutPod(FileLayout);
+// FileLayout consists of eleven u32 fields, with no padding or invalid bits.
+unsafe impl aya::Pod for FileLayoutPod {}
 
 pub struct EbpfBlocker {
     ebpf: Ebpf,
@@ -81,6 +98,31 @@ impl EbpfBlocker {
         .map_err(|err| CardwireEbpfError::EbpfLoadError(err.to_string()))?;
 
         let btf = Btf::from_sys_fs().map_err(CardwireEbpfError::aya)?;
+        let bytes = btf.to_bytes();
+        let layout = kernel_layout::task_from_btf_bytes(&bytes).map_err(|error| {
+            CardwireEbpfError::Other(format!("Unsupported kernel task layout: {error}"))
+        })?;
+        let files = kernel_layout::files_from_btf_bytes(&bytes).map_err(|error| {
+            CardwireEbpfError::Other(format!("Unsupported kernel file layout: {error}"))
+        })?;
+        let mut layout_map: Array<_, TaskLayoutPod> = Array::try_from(
+            ebpf.map_mut("CW_TASK_LAYOUT")
+                .ok_or_else(|| CardwireEbpfError::missing_map("CW_TASK_LAYOUT"))?,
+        )
+        .map_err(CardwireEbpfError::aya)?;
+        layout_map
+            .set(0, TaskLayoutPod(layout), 0)
+            .map_err(CardwireEbpfError::aya)?;
+        info!("Kernel task layout from BTF: {layout:?}");
+        let mut files_map: Array<_, FileLayoutPod> = Array::try_from(
+            ebpf.map_mut("CW_FILE_LAYOUT")
+                .ok_or_else(|| CardwireEbpfError::missing_map("CW_FILE_LAYOUT"))?,
+        )
+        .map_err(CardwireEbpfError::aya)?;
+        files_map
+            .set(0, FileLayoutPod(files), 0)
+            .map_err(CardwireEbpfError::aya)?;
+        info!("Kernel file layout from BTF: {files:?}");
 
         let lsm_load_list: [&str; 3] = ["file_open", "inode_permission", "inode_getattr"];
         for entity in lsm_load_list {

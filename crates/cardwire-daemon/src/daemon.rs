@@ -4,6 +4,8 @@ mod core;
 mod file;
 mod interface;
 mod manager;
+#[cfg(feature = "service-roles")]
+mod service_owner;
 mod tasks;
 pub mod types;
 
@@ -19,14 +21,25 @@ pub const CONFIG_PATH: &str = "/etc/cardwire";
 /// Cardwire state directory.
 pub const STATE_PATH: &str = "/var/lib/cardwire";
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // log
     env_logger::Builder::from_env(Env::default().default_filter_or("info"))
         .format_target(false)
         .format_timestamp(None)
         .init();
 
+    // Opt-in persistent service-role ownership. Systemd activation FDs must be
+    // taken while the process is still single-threaded, i.e. before the runtime.
+    #[cfg(feature = "service-roles")]
+    service_owner::start();
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     // Build the DaemonManager, it mostly consists of reading config files and setting up Arc and
     // RwLocks
     let mut daemon = DaemonManager::new().await?;
@@ -178,6 +191,13 @@ async fn spawn_dbus_api(
                 "Failed to get the Logger interface ({e}); logger notifications will not be emitted"
             );
         }
+    }
+
+    #[cfg(feature = "service-roles")]
+    if service_owner::guard().is_some() {
+        object_server
+            .at(path, crate::interface::ServiceRolesInterface)
+            .await?;
     }
 
     // Cardwire Smart Policy

@@ -115,6 +115,12 @@
       env_out_2 = machine.succeed("cardwire launch --gpu 2 env")
       t.assertIn("CARDWIRE_FORCE_GPU=2", env_out_2, "Missing CARDWIRE_FORCE_GPU=2")
       t.assertIn("DRI_PRIME=pci", env_out_2, "Missing DRI_PRIME")
+
+    with subtest("Kernel layout probes remain healthy"):
+      machine.succeed("journalctl --sync")
+      journal = machine.succeed("journalctl -b -u cardwired.service --no-pager")
+      t.assertNotIn("could not read", journal)
+      t.assertIn("Kernel file layout from BTF", journal)
   '';
 
 }

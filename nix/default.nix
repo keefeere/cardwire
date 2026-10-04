@@ -12,6 +12,12 @@ pkgs.rustPlatform.buildRustPackage {
   pname = "cardwire";
   src = ./..;
   cargoLock.lockFile = ../Cargo.lock;
+  # Match the fork's release artifact build. Fat LTO of the GUI exceeds the
+  # bounded VM-build container's memory; keep the full package and VM gates.
+  cargoBuildFlags = [
+    "--config"
+    "profile.release.lto=false"
+  ];
 
   nativeBuildInputs = [
     pkgs.clang

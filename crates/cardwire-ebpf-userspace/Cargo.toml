@@ -7,6 +7,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# No installed daemon path enables this candidate yet.
+experimental-service-roles = []
+
 [dependencies]
 thiserror.workspace = true
 aya.workspace = true
@@ -16,9 +20,19 @@ log.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 env_logger.workspace = true
+cardwire-policy = { path = "../cardwire-policy" }
+libc = "0.2"
 
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
 cargo_metadata = { workspace = true }
 cardwire-ebpf = { path = "../cardwire-ebpf" }
+
+[[example]]
+name = "service-snapshots-vm"
+required-features = ["experimental-service-roles"]
+
+[[example]]
+name = "persistent-snapshots-vm"
+required-features = ["experimental-service-roles"]

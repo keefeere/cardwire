@@ -50,18 +50,55 @@ def read_line(process):
     return json.loads(line)
 
 
+def device_access(permission_only=False):
+    accessible = []
+    for device in ["/dev/dri/renderD128", "/dev/dri/renderD129"]:
+        if permission_only:
+            # faccessat checks inode_permission without opening the device;
+            # a working file_open hook cannot mask a broken inode lookup.
+            accessible.append(os.access(device, os.R_OK, effective_ids=True))
+            continue
+        try:
+            fd = os.open(device, os.O_RDONLY | os.O_CLOEXEC)
+            os.close(fd)
+            accessible.append(True)
+        except OSError:
+            accessible.append(False)
+    return accessible
+
+
+def child_access():
+    # No exec/environment analyzer, no inherited GPU FD: test the actual
+    # parent-policy lookup for fresh device opens in an otherwise ungranted child.
+    reader, writer = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(reader)
+        try:
+            os.write(writer, json.dumps(device_access()).encode())
+        finally:
+            os.close(writer)
+            os._exit(0)
+    os.close(writer)
+    try:
+        ready, _, _ = select.select([reader], [], [], 10)
+        assert ready, "child GPU open timed out"
+        result = json.loads(os.read(reader, 1024))
+    finally:
+        os.close(reader)
+        # Test-owned diagnostic child only, never a host service/process.
+        reaped, status = os.waitpid(pid, os.WNOHANG)
+        if not reaped:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+    return result
+
+
 def probe():
     print(json.dumps(os.getpid()), flush=True)
-    for _ in sys.stdin:
-        accessible = []
-        for device in ["/dev/dri/renderD128", "/dev/dri/renderD129"]:
-            try:
-                fd = os.open(device, os.O_RDONLY | os.O_CLOEXEC)
-                os.close(fd)
-                accessible.append(True)
-            except OSError:
-                accessible.append(False)
-        print(json.dumps(accessible), flush=True)
+    for command in sys.stdin:
+        print(json.dumps(child_access() if command.strip() == "child"
+                         else device_access(command.strip() == "access")), flush=True)
 
 
 def main():
@@ -82,7 +119,7 @@ def main():
         # Read-only status still works; Default must not bypass authorization.
         for _, pid in workers:
             before = status(pid)
-            for policy, value in [("Allow_dGPU", 1), ("Force_GPU", 0), ("Default", 0)]:
+            for policy, value in [("Allow_dGPU", 1), ("Allow_dGPU_Exact", 1), ("Force_GPU", 0), ("Default", 0)]:
                 request(pid, policy, value, user="john", denied=True)
                 assert call("GetProcessStatus", "u", pid, user="john") == before
             request(pid, "Force_GPU", 0)
@@ -99,15 +136,28 @@ def main():
 
         def assert_enforcement():
             policy, gpu = status(pid)
-            assert policy in ("Allowed", "Forced"), (policy, gpu)
-            expected = expected_access["Allowed" if policy == "Allowed" else gpu[0]]
-            worker.stdin.write("probe\n")
-            worker.stdin.flush()
-            assert read_line(worker) == expected, (policy, gpu, expected)
+            assert policy in ("Allowed", "AllowedExact", "Forced"), (policy, gpu)
+            expected = expected_access["Allowed" if policy in ("Allowed", "AllowedExact") else gpu[0]]
+            for operation in ("probe", "access"):
+                worker.stdin.write(operation + "\n")
+                worker.stdin.flush()
+                actual = read_line(worker)
+                assert actual == expected, (operation, policy, gpu, actual, expected, pid)
 
         # Verify both directions deterministically before racing writers.
-        for policy, value in [("Allow_dGPU", 1), ("Force_GPU", 0), ("Force_GPU", 1)]:
+        for policy, value in [("Allow_dGPU", 1), ("Allow_dGPU_Exact", 1), ("Force_GPU", 0), ("Force_GPU", 1)]:
             request(pid, policy, value)
+            assert_enforcement()
+
+        for policy, child_expected in [("Allow_dGPU", [True, True]),
+                                       ("Allow_dGPU_Exact", [True, False])]:
+            request(pid, policy, 1)
+            assert_enforcement()
+            worker.stdin.write("child\n")
+            worker.stdin.flush()
+            actual = read_line(worker)
+            assert actual == child_expected, (policy, actual, child_expected, pid)
+            # Parent policy remains unchanged by the child's exit hook.
             assert_enforcement()
 
         # The last writer need not be predictable; status and enforcement must
@@ -116,13 +166,13 @@ def main():
         with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
             for _ in range(20):
                 futures = [pool.submit(request, pid, policy, value)
-                           for policy, value in [("Allow_dGPU", 1), ("Force_GPU", 0),
+                           for policy, value in [("Allow_dGPU", 1), ("Allow_dGPU_Exact", 1), ("Force_GPU", 0),
                                                  ("Force_GPU", 1)] * 4]
                 for future in futures:
                     future.result(timeout=20)
                 assert_enforcement()
 
-        print("PASS: authenticated root-only requests and 240 concurrent policy writes")
+        print("PASS: root-only requests, exact-vs-inherited opens, inode permissions and 320 concurrent policy writes")
     finally:
         for worker, _ in workers:
             worker.stdin.close()

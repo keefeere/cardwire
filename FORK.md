@@ -20,6 +20,22 @@ upstream release. Changes in this fork were developed with OpenAI Codex assistan
   `Default` as a no-op are retained. Status describes the PID's own entry, not
   all inherited effects: Smart mode still gives a direct parent's Allow priority
   over a child's Force; Manual mode still honors only Force entries.
+- Optional root-only `Allow_dGPU_Exact` (`value=1`) is distinct from legacy Allow:
+  it permits the named process/TGID in Smart without granting its children by
+  parent-PID lookup. Status is `AllowedExact`; it does not change existing
+  environment/application policies and is cleared on exec/exit like other entries.
+  It does not revoke or contain open/inherited/passed device descriptors.
+- Parent-policy lookup resolves `task_struct.real_parent` and `tgid` from the
+  running kernel's BTF before attaching hooks, instead of using offsets from
+  the generated build-time task layout. Field types, bounds and alignment are
+  checked; unsupported layouts fail initialization without a static fallback.
+  Each lookup also checks the current TGID against the kernel helper before
+  reading the parent.
+- File/inode hooks likewise resolve their required `file`, `path`, `dentry`
+  and `inode` fields from running-kernel BTF, including anonymous/named alias
+  unions. Invalid types, ambiguous members, overlap or out-of-bounds offsets
+  reject initialization before hooks attach. Kernel pointers are read through
+  probe helpers. This is bounded runtime layout resolution, not full CO-RE.
 
 This is **not a general security sandbox**. Other existing global configuration
 APIs, environment hints, inherited grants and built-in service exemptions are
@@ -56,9 +72,12 @@ nix build --no-link --print-build-logs .#checks.x86_64-linux.vm-ci-15gpu
 ```
 
 The two-GPU VM exercises actual D-Bus authorization (own/foreign/root targets),
-fresh and repeated requests, and 240 concurrent Allow/Force writes, comparing
+fresh and repeated requests, exact-versus-inherited child device opens, and
+320 concurrent Allow/Exact/Force writes, comparing
 the final status with actual device opens by the same still-running process.
 These are isolated virtual-GPU tests, not proof of NVIDIA/USB4 hardware behavior.
+The new exact-allow cases must pass in the VM before deploying that feature;
+source-level policy tests alone do not establish loaded-kernel enforcement.
 
 ## Deployment boundary
 

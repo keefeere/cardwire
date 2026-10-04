@@ -8,7 +8,13 @@ rust-version.workspace = true
 license.workspace = true
 description = "Daemon for cardwire GPU management"
 
+[features]
+# Opt-in persistent service-role owner (default OFF; see src/service_owner.rs).
+service-roles = ["cardwire-ebpf-userspace/experimental-service-roles", "dep:anyhow", "dep:libc"]
+
 [dependencies]
+anyhow = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
 cardwire-policy = { path = "../cardwire-policy" }
 cardwire-ebpf-userspace = { path = "../cardwire-ebpf-userspace" }
 tokio.workspace = true

@@ -8,8 +8,8 @@ use aya_log_ebpf::{debug, error, warn};
 
 use crate::{
     helpers::{
-        KeyBuild, MAX_DIRENTS, SCAN_OK, SCAN_READ_FAILED, SCAN_WRITE_FAILED, ScanCtx, dentry_key, inode_key, is_cardwired, is_comm_whitelisted, is_hybrid, is_inode_blocked, is_manual, is_smart, scan_dirent
-    }, maps::{CW_DIRENT, CW_EXEC_EVENTS, CW_PID_POLICY, ExecEvent}, vmlinux::{dentry, file, inode, path}
+        KeyBuild, MAX_DIRENTS, SCAN_OK, SCAN_READ_FAILED, SCAN_WRITE_FAILED, ScanCtx, file_key, inode_key, is_cardwired, is_comm_whitelisted, is_hybrid, is_inode_blocked, is_manual, is_smart, path_key, scan_dirent
+    }, maps::{CW_DIRENT, CW_EXEC_EVENTS, CW_PID_POLICY, ExecEvent}
 };
 
 #[allow(
@@ -115,19 +115,8 @@ unsafe fn try_file_open(ctx: LsmContext) -> Result<i32, i32> {
         }
     }
 
-    let file_ptr: *const file = ctx.arg(0);
-    if file_ptr.is_null() {
-        return ReturnCode::SUCCESS;
-    }
-
-    let d: *mut dentry = unsafe { (*file_ptr).__bindgen_anon_1.f_path.dentry };
-
-    // if no dentry, exit
-    if d.is_null() {
-        return ReturnCode::SUCCESS;
-    }
-
-    let key = match unsafe { dentry_key(d) } {
+    let file_ptr: *const u8 = ctx.arg(0);
+    let key = match unsafe { file_key(file_ptr) } {
         KeyBuild::Key(key) => key,
         KeyBuild::Unnamed => {
             debug!(
@@ -201,7 +190,7 @@ unsafe fn try_inode_permission(ctx: LsmContext) -> Result<i32, i32> {
     }
 
     // Get a mutable ptr to the inode, in inode_permission it's the first argument
-    let inode_ptr: *mut inode = ctx.arg(0);
+    let inode_ptr: *const u8 = ctx.arg(0);
 
     if inode_ptr.is_null() {
         return ReturnCode::SUCCESS;
@@ -280,18 +269,8 @@ unsafe fn try_inode_getattr(ctx: LsmContext) -> Result<i32, i32> {
         }
     }
 
-    let path_ptr: *const path = ctx.arg(0);
-    if path_ptr.is_null() {
-        return ReturnCode::SUCCESS;
-    }
-
-    let dentry_ptr: *mut dentry = unsafe { (*path_ptr).dentry };
-
-    if dentry_ptr.is_null() {
-        return ReturnCode::SUCCESS;
-    }
-
-    let key = match unsafe { dentry_key(dentry_ptr) } {
+    let path_ptr: *const u8 = ctx.arg(0);
+    let key = match unsafe { path_key(path_ptr) } {
         KeyBuild::Key(key) => key,
         KeyBuild::Unnamed => {
             debug!(

@@ -765,6 +765,7 @@ dependencies = [
 name = "cardwire-daemon"
 version = "0.12.3"
 dependencies = [
+ "anyhow",
  "aya",
  "aya-log",
  "cardwire-ebpf-userspace",
@@ -773,6 +774,7 @@ dependencies = [
  "freedesktop-desktop-entry",
  "inotify",
  "khronos-egl",
+ "libc",
  "log",
  "rusqlite",
  "serde",
@@ -806,9 +808,11 @@ dependencies = [
  "aya-build",
  "aya-log",
  "cardwire-ebpf",
+ "cardwire-policy",
  "cargo_metadata",
  "clap",
  "env_logger",
+ "libc",
  "log",
  "thiserror 2.0.20",
  "tokio",

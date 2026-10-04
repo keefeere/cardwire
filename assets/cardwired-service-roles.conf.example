@@ -1,0 +1,13 @@
+# OPT-IN drop-in for a cardwired built with `--features service-roles`.
+# Install as /etc/systemd/system/cardwired.service.d/90-service-roles.conf
+# together with /etc/cardwire/service-roles.toml (enabled = true).
+# NOT installed by default; the default unit and daemon are unchanged.
+[Service]
+# FD store needs the main process to talk to the notify socket.
+NotifyAccess=main
+# Fixed catalog: one FD per device + up to two per role + 1 manifest.
+FileDescriptorStoreMax=64
+# Stored object references must survive stop/failure.
+FileDescriptorStorePreserve=yes
+# ProtectSystem=strict hides /sys/fs/bpf writes; the pin directory is created here.
+ReadWritePaths=/sys/fs/bpf

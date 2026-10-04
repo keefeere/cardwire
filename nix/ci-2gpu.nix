@@ -146,6 +146,14 @@ in
     with subtest("PID authorization and concurrent policy enforcement"):
       machine.succeed("${(pkgs system).python3}/bin/python3 ${./process-policy-test.py} --test-vm-only", timeout=180)
 
+    with subtest("Task-storage identity primitive (not persistent-profile enforcement)"):
+      machine.succeed("cardwire set hybrid")
+      machine.succeed("touch /run/cardwire-lifecycle-vm-only")
+      try:
+        machine.succeed("${(pkgs system).python3}/bin/python3 ${./task-storage-probe.py} --vm-only", timeout=90)
+      finally:
+        machine.succeed("rm /run/cardwire-lifecycle-vm-only")
+
     with subtest("Try to block default gpu"):
       t.assertIn("Per GPU block is only available on manual mode", machine.fail("cardwire gpu 0 --block 2>&1"), "Default gpu got blocked")
 
@@ -192,6 +200,12 @@ in
       machine.succeed(
         "bwrap --dev-bind / / --tmpfs /tmp ${sandboxCollision} " + dgpu_ino
       )
+
+    with subtest("Kernel layout probes remain healthy"):
+      machine.succeed("journalctl --sync")
+      journal = machine.succeed("journalctl -b -u cardwired.service --no-pager")
+      t.assertNotIn("could not read", journal)
+      t.assertIn("Kernel file layout from BTF", journal)
 
   '';
 }

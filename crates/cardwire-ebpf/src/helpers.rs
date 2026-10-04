@@ -1,15 +1,15 @@
 use aya_ebpf::helpers::{
     bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_probe_read_user, bpf_probe_read_user_str_bytes, bpf_probe_write_user, generated::bpf_get_current_task
 };
-use cardwire_policy::ProcessPolicy;
+use cardwire_policy::{FileLayout, ProcessPolicy};
 
 use crate::{
     CardwiredSetting, DAEMON_INDEX, HYBRID, INTEGRATED, MANUAL, MODE_INDEX, SMART, maps::{
-        CW_ALLOWED_COMM, CW_BLOCKED_INO, CW_DAEMON_PID, CW_EXP_BLK_INO, CW_MODE, CW_PID_POLICY, CW_REPORT_EVENTS, CW_SETTINGS, InodeKey, ReportEvent
+        CW_ALLOWED_COMM, CW_BLOCKED_INO, CW_DAEMON_PID, CW_EXP_BLK_INO, CW_FILE_LAYOUT, CW_MODE, CW_PID_POLICY, CW_REPORT_EVENTS, CW_SETTINGS, CW_TASK_LAYOUT, InodeKey, ReportEvent
     }
 };
 
-use crate::vmlinux::{dentry, inode, linux_dirent64, task_struct};
+use crate::vmlinux::linux_dirent64;
 
 /// Outcome of building a block-map key from a dentry or an inode
 pub enum KeyBuild {
@@ -23,26 +23,36 @@ pub enum KeyBuild {
     ProbeFailed,
 }
 
-/// Build the block-map key for a dentry, keying on the entry's name and inode
 #[inline(always)]
-pub unsafe fn dentry_key(d: *const dentry) -> KeyBuild {
+fn file_layout() -> Option<FileLayout> {
+    let layout = *CW_FILE_LAYOUT.get(0)?;
+    if layout.is_valid() {
+        Some(layout)
+    } else {
+        None
+    }
+}
+
+/// Build the key using validated runtime offsets, never a generated kernel
+/// struct dereference. All pointer targets are read through safe probe helpers.
+#[inline(always)]
+unsafe fn dentry_key(d: *const u8, layout: FileLayout) -> KeyBuild {
     if d.is_null() {
         return KeyBuild::Unnamed;
     }
 
-    // The dentry may have been reconstructed from inode->i_dentry.first
-    // (inode_permission), which the verifier refuses to dereference directly:
-    // read the fields through probe reads instead
-    let inode_ptr = match unsafe { bpf_probe_read_kernel(core::ptr::addr_of!((*d).d_inode)) } {
-        Ok(inode_ptr) => inode_ptr,
-        Err(_) => return KeyBuild::ProbeFailed,
-    };
+    let inode_ptr: *const u8 =
+        match unsafe { bpf_probe_read_kernel(d.wrapping_add(layout.dentry_inode as usize).cast()) }
+        {
+            Ok(inode_ptr) => inode_ptr,
+            Err(_) => return KeyBuild::ProbeFailed,
+        };
     if inode_ptr.is_null() {
         return KeyBuild::Unnamed;
     }
 
-    let name_ptr = match unsafe {
-        bpf_probe_read_kernel(core::ptr::addr_of!((*d).__bindgen_anon_1.d_name.name))
+    let name_ptr: *const u8 = match unsafe {
+        bpf_probe_read_kernel(d.wrapping_add(layout.dentry_name as usize).cast())
     } {
         Ok(name_ptr) => name_ptr,
         Err(_) => return KeyBuild::ProbeFailed,
@@ -51,7 +61,9 @@ pub unsafe fn dentry_key(d: *const dentry) -> KeyBuild {
         return KeyBuild::Unnamed;
     }
 
-    let ino = match unsafe { bpf_probe_read_kernel(core::ptr::addr_of!((*inode_ptr).i_ino)) } {
+    let ino: u64 = match unsafe {
+        bpf_probe_read_kernel(inode_ptr.wrapping_add(layout.inode_number as usize).cast())
+    } {
         Ok(ino) => ino,
         Err(_) => return KeyBuild::ProbeFailed,
     };
@@ -66,22 +78,62 @@ pub unsafe fn dentry_key(d: *const dentry) -> KeyBuild {
 
 /// Build the block-map key for an inode, keying on the entry's name and inode
 #[inline(always)]
-pub unsafe fn inode_key(inode_ptr: *const inode) -> KeyBuild {
+pub unsafe fn inode_key(inode_ptr: *const u8) -> KeyBuild {
     if inode_ptr.is_null() {
         return KeyBuild::Unnamed;
     }
 
-    let alias = unsafe { (*inode_ptr).__bindgen_anon_2.i_dentry.first };
+    let Some(layout) = file_layout() else {
+        return KeyBuild::ProbeFailed;
+    };
+    let alias: *const u8 = match unsafe {
+        bpf_probe_read_kernel(inode_ptr.wrapping_add(layout.inode_alias as usize).cast())
+    } {
+        Ok(alias) => alias,
+        Err(_) => return KeyBuild::ProbeFailed,
+    };
     if alias.is_null() {
         // Anonymous inode (epoll, eventfd, dma-buf, ...): no name by design
         return KeyBuild::Unnamed;
     }
 
-    // Wrapping_sub is used to prevent bpf bytecode from being rejected
-    let d = (alias as usize).wrapping_sub(core::mem::offset_of!(dentry, __bindgen_anon_3))
-        as *mut dentry;
+    let d = alias.wrapping_sub(layout.dentry_alias as usize);
 
-    unsafe { dentry_key(d) }
+    unsafe { dentry_key(d, layout) }
+}
+
+#[inline(always)]
+pub unsafe fn file_key(file: *const u8) -> KeyBuild {
+    if file.is_null() {
+        return KeyBuild::Unnamed;
+    }
+    let Some(layout) = file_layout() else {
+        return KeyBuild::ProbeFailed;
+    };
+    let d: *const u8 = match unsafe {
+        bpf_probe_read_kernel(file.wrapping_add(layout.file_dentry as usize).cast())
+    } {
+        Ok(d) => d,
+        Err(_) => return KeyBuild::ProbeFailed,
+    };
+    unsafe { dentry_key(d, layout) }
+}
+
+#[inline(always)]
+pub unsafe fn path_key(path: *const u8) -> KeyBuild {
+    if path.is_null() {
+        return KeyBuild::Unnamed;
+    }
+    let Some(layout) = file_layout() else {
+        return KeyBuild::ProbeFailed;
+    };
+    let d: *const u8 = match unsafe {
+        bpf_probe_read_kernel(path.wrapping_add(layout.path_dentry as usize).cast())
+    } {
+        Ok(d) => d,
+        Err(_) => return KeyBuild::ProbeFailed,
+    };
+    unsafe { dentry_key(d, layout) }
 }
 
 /// Verify if the file is inside CW_BLOCKED_INO or not
@@ -138,12 +190,12 @@ pub unsafe fn is_inode_blocked(key: InodeKey) -> bool {
         if *mode == MANUAL {
             let ppid = get_task_ppid().unwrap_or(u32::MAX);
 
-            let own = unsafe { CW_PID_POLICY.get(pid).copied() }.and_then(ProcessPolicy::decode);
-            let parent =
-                unsafe { CW_PID_POLICY.get(ppid).copied() }.and_then(ProcessPolicy::decode);
-            if let Some(ProcessPolicy::Forced(pid_gpu_id)) = ProcessPolicy::manual(own, parent) {
+            let own = unsafe { CW_PID_POLICY.get(pid).copied() }.unwrap_or(ProcessPolicy::NONE);
+            let parent = unsafe { CW_PID_POLICY.get(ppid).copied() }.unwrap_or(ProcessPolicy::NONE);
+            let policy = ProcessPolicy::manual_encoded(own, parent);
+            if policy <= u32::MAX as u64 {
                 // If forced GPU ID matches the inode's GPU ID, allow access
-                match pid_gpu_id == ino_gpu_id {
+                match policy == ino_gpu_id as u64 {
                     true => break 'end,
                     false => {
                         report_event(pid, ino_gpu_id, comm);
@@ -168,18 +220,17 @@ pub unsafe fn is_inode_blocked(key: InodeKey) -> bool {
 
             // Copy each complete value once: concurrent replacement cannot
             // make this lookup observe both an Allow and a Force for one PID.
-            let own = unsafe { CW_PID_POLICY.get(pid).copied() }.and_then(ProcessPolicy::decode);
-            let parent =
-                unsafe { CW_PID_POLICY.get(ppid).copied() }.and_then(ProcessPolicy::decode);
-            let policy = ProcessPolicy::smart(own, parent);
-            if policy == Some(ProcessPolicy::Allowed) {
+            let own = unsafe { CW_PID_POLICY.get(pid).copied() }.unwrap_or(ProcessPolicy::NONE);
+            let parent = unsafe { CW_PID_POLICY.get(ppid).copied() }.unwrap_or(ProcessPolicy::NONE);
+            let policy = ProcessPolicy::smart_encoded(own, parent);
+            if policy == ProcessPolicy::Allowed.encode() {
                 break 'end;
             }
-            if let Some(ProcessPolicy::Forced(pid_gpu_id)) = policy {
+            if policy <= u32::MAX as u64 {
                 // We match the ino_gpu_id with the pid_gpu_id
                 // If they match, that means the ino is owned by the said GPU id, and we want to
                 // force the process to use said GPU id
-                match pid_gpu_id == ino_gpu_id {
+                match policy == ino_gpu_id as u64 {
                     // The process should be allowed to see the inode
                     true => break 'end,
                     // Process should only be allowed to see the said GPU id
@@ -222,27 +273,33 @@ fn report_event(pid: u32, gpu_id: u32, comm: [u8; 16]) {
 
 #[inline(always)]
 fn get_task_ppid() -> Option<u32> {
-    let task: *const task_struct = unsafe { bpf_get_current_task() as *const task_struct };
+    let layout = *CW_TASK_LAYOUT.get(0)?;
+    if !layout.is_valid() {
+        return None;
+    }
+    let task = unsafe { bpf_get_current_task() as *const u8 };
     if task.is_null() {
         return None;
     }
 
-    let real_parent =
-        match unsafe { bpf_probe_read_kernel(core::ptr::addr_of!((*task).real_parent)) } {
-            Ok(parent) => parent,
-            Err(_) => {
-                return None;
-            }
-        };
-
+    // Sanity-check the runtime layout against an independent kernel helper.
+    // Never dereference the generated, kernel-config-specific task_struct.
+    let own_tgid: i32 =
+        unsafe { bpf_probe_read_kernel(task.wrapping_add(layout.tgid as usize).cast()).ok()? };
+    if own_tgid <= 0 || own_tgid as u32 != (bpf_get_current_pid_tgid() >> 32) as u32 {
+        return None;
+    }
+    let real_parent: *const u8 = unsafe {
+        bpf_probe_read_kernel(task.wrapping_add(layout.real_parent as usize).cast()).ok()?
+    };
     if real_parent.is_null() {
         return None;
     }
 
-    match unsafe { bpf_probe_read_kernel(core::ptr::addr_of!((*real_parent).tgid)) } {
-        Ok(ppid) => Some(ppid as u32),
-        Err(_) => None,
-    }
+    let ppid: i32 = unsafe {
+        bpf_probe_read_kernel(real_parent.wrapping_add(layout.tgid as usize).cast()).ok()?
+    };
+    if ppid > 0 { Some(ppid as u32) } else { None }
 }
 
 /// Verify if the proc is whitelisted, returns false if not

@@ -10,6 +10,7 @@ import importlib.util
 import os
 from pathlib import Path
 import select
+import socket
 import stat
 import subprocess
 import time
@@ -219,6 +220,43 @@ def main():
         spawn(cg2, 0)
         spawn(cg, -13)
         print('PASS: SIGKILL after re-enrollment adopts the new catalog epoch', flush=True)
+
+        # Interrupted re-enrollment leftovers: inject stray store entries from inside the
+        # unit cgroup (VM only, NotifyAccess=all), as a crash between store/cleanup would.
+        def inject(name, path):
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+            unit_cgroup = Path('/sys/fs/cgroup/system.slice') / unit
+            try:
+                (unit_cgroup / 'cgroup.procs').write_text(str(os.getpid()))
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+                sock.connect('/run/systemd/notify')
+                socket.send_fds(sock, [f'FDSTORE=1\nFDPOLL=0\nFDNAME={name}'.encode()], [fd])
+                sock.close()
+            finally:
+                Path('/sys/fs/cgroup/cgroup.procs').write_text(str(os.getpid()))
+                os.close(fd)
+            time.sleep(0.5)
+
+        inject('cw-cg-0-8', cg)  # plausible uncommitted new reference (generation 7 + 1)
+        assert int(prop('NFileDescriptorStore')) == count + 1
+        control('stop', unit)
+        control('start', unit)
+        pid = wait_active()
+        assert int(prop('NFileDescriptorStore')) == count, 'stale reference not removed'
+        assert 'service-roles: adopted generation 7' in journal()
+        spawn(cg2, 0)
+        spawn(cg, -13)
+        print('PASS: leftovers of an interrupted re-enrollment are garbage-collected at adoption', flush=True)
+
+        inject('cw-bogus', cg)  # foreign descriptor: adoption must refuse, enforcement stays
+        control('stop', unit)
+        control('start', unit)
+        wait_active()
+        assert 'foreign owner descriptor cw-bogus' in journal(), journal()
+        assert int(prop('NFileDescriptorStore')) == count + 1  # nothing guessed or removed
+        spawn(cg2, 0)
+        spawn(cg, -13)
+        print('PASS: foreign stored descriptor refuses adoption; enforcement untouched', flush=True)
 
         # Pins present but FD store emptied: refuse to recreate, keep legacy running.
         control('stop', unit)

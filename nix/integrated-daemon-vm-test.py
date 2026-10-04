@@ -40,7 +40,7 @@ dropin = (
     '[Service]\nExecStart=\n'
     f'ExecStart={loader} /root/cardwired-service-roles\n'
     f'Environment="LD_LIBRARY_PATH={daemon_libraries}"\n'
-    'NotifyAccess=main\nFileDescriptorStoreMax=64\nFileDescriptorStorePreserve=yes\n'
+    'NotifyAccess=all\nFileDescriptorStoreMax=64\nFileDescriptorStorePreserve=yes\n'
     'ReadWritePaths=/sys/fs/bpf\nRestart=on-failure\nRestartSec=2s\n')
 machine.succeed('cat > /run/systemd/system/cardwired.service.d/99-integrated.conf <<"EOF"\n' + dropin + 'EOF')
 machine.succeed('test ! -e /run/cardwire-lifecycle-vm-only && touch /run/cardwire-lifecycle-vm-only')

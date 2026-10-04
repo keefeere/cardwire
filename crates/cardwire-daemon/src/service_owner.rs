@@ -207,7 +207,17 @@ fn build(
             .collect::<Result<Vec<_>>>()?;
         PersistentGuard::create(&config.bpf_object, devices, roles, &config.pin_dir, &owner)?
     } else {
-        PersistentGuard::adopt(held.context("no descriptors")?, &config.pin_dir, &owner)?
+        let devices = config
+            .devices
+            .iter()
+            .map(|p| open_path(p, libc::O_PATH))
+            .collect::<Result<Vec<_>>>()?;
+        PersistentGuard::adopt(
+            held.context("no descriptors")?,
+            devices,
+            &config.pin_dir,
+            &owner,
+        )?
     };
     info!(
         "service-roles: {} generation {}",

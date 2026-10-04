@@ -135,9 +135,8 @@ impl Manifest {
 
     fn names(&self) -> BTreeSet<String> {
         let mut names = BTreeSet::from([self.name()]);
-        for n in 0..self.inventory.count {
-            names.insert(format!("cw-dev-{n}"));
-        }
+        // Device nodes are deliberately NOT stored in systemd: SELinux may forbid
+        // init_t ioctl on them and the identity check re-opens configured paths.
         for n in 0..self.catalog.role_count as usize {
             names.insert(self.exe_name(n));
             names.insert(self.cg_name(n));
@@ -320,7 +319,6 @@ fn verify_frozen<T: Pod>(array: &mut Array<MapData, T>, value: T) -> Result<()> 
     Ok(())
 }
 
-
 fn read_manifests(held: &BTreeMap<String, OwnedFd>) -> Result<Vec<Manifest>> {
     let mut found = Vec::new();
     for (name, fd) in held {
@@ -347,8 +345,7 @@ fn read_manifests(held: &BTreeMap<String, OwnedFd>) -> Result<Vec<Manifest>> {
     }
     found.sort_by_key(|m| m.epoch);
     ensure!(
-        matches!(found.len(), 1 | 2)
-            && (found.len() == 1 || found[1].epoch == found[0].epoch + 1),
+        matches!(found.len(), 1 | 2) && (found.len() == 1 || found[1].epoch == found[0].epoch + 1),
         "missing, extra or non-consecutive owner manifests"
     );
     Ok(found)
@@ -428,6 +425,10 @@ impl PersistentGuard {
         owner: &SystemdOwner<'_>,
     ) -> Result<Self> {
         ensure!(!base.exists(), "refusing existing owner pins");
+        let adoption_devices = devices
+            .iter()
+            .map(File::try_clone)
+            .collect::<io::Result<Vec<_>>>()?;
         let mut guard = ServiceGuard::attach(object, devices)?;
         let roles = registrations
             .iter()
@@ -442,9 +443,6 @@ impl PersistentGuard {
         };
         manifest.validate()?;
         let mut held = BTreeMap::new();
-        for (n, device) in guard._devices.iter().enumerate() {
-            held.insert(format!("cw-dev-{n}"), device.as_fd().try_clone_to_owned()?);
-        }
         for (n, registration) in registrations.iter().enumerate() {
             if manifest.exe_slot(n) == n {
                 held.insert(
@@ -503,11 +501,14 @@ impl PersistentGuard {
         held.insert(manifest.name(), file.into());
         owner.check(held.len(), capacity)?;
         // Creation and restart use exactly the same complete adoption checks.
-        Self::adopt(held, base, owner)
+        Self::adopt(held, adoption_devices, base, owner)
     }
 
+    /// `devices`: the configured protected nodes, re-opened by the caller; their
+    /// device numbers must equal the stored inventory (identity, not retention).
     pub fn adopt(
         mut held: BTreeMap<String, OwnedFd>,
+        devices: Vec<File>,
         base: &Path,
         owner: &SystemdOwner<'_>,
     ) -> Result<Self> {
@@ -569,8 +570,12 @@ impl PersistentGuard {
             "incomplete/foreign owner descriptor set"
         );
         owner.check(held.len(), held.len())?;
-        for n in 0..manifest.inventory.count as usize {
-            let meta = File::from(held[&format!("cw-dev-{n}")].try_clone()?).metadata()?;
+        ensure!(
+            devices.len() == manifest.inventory.count as usize,
+            "configured device count differs from the stored inventory"
+        );
+        for (n, device) in devices.iter().enumerate() {
+            let meta = device.metadata()?;
             ensure!(
                 meta.file_type().is_char_device()
                     && kernel_dev(meta.rdev())? == manifest.inventory.devices[n],
@@ -832,7 +837,7 @@ mod tests {
         let bytes = manifest.encode().unwrap();
         assert_eq!(bytes.len(), BYTES);
         assert_eq!(Manifest::decode(&bytes).unwrap(), manifest);
-        assert_eq!(manifest.names().len(), 6); // manifest, 2 devices, 1 exe, 2 cgroups
+        assert_eq!(manifest.names().len(), 4); // manifest, 1 exe, 2 cgroups
         for n in 0..bytes.len() {
             assert!(Manifest::decode(&bytes[..n]).is_err());
         }
@@ -888,7 +893,10 @@ mod tests {
         assert!(old.check_policy(&active).is_err());
         assert_eq!(next.decode_roundtrip(), next);
         let added: Vec<_> = next.names().difference(&old.names()).cloned().collect();
-        assert_eq!(added, vec!["cw-cg-1-2".to_owned(), "cw-manifest-2".to_owned()]);
+        assert_eq!(
+            added,
+            vec!["cw-cg-1-2".to_owned(), "cw-manifest-2".to_owned()]
+        );
     }
 
     #[test]
@@ -917,9 +925,19 @@ mod tests {
         // Interrupted cleanup left old references and the old manifest.
         held.extend(old.names().difference(&next.names()).cloned());
         let stale = stale_names(held.iter(), &next.names(), 2).unwrap();
-        assert_eq!(stale, vec!["cw-cg-1-1".to_owned(), "cw-manifest-1".to_owned()]);
+        assert_eq!(
+            stale,
+            vec!["cw-cg-1-1".to_owned(), "cw-manifest-1".to_owned()]
+        );
         // Foreign / implausible names are an error, not garbage.
-        for bad in ["cw-dev-9", "evil", "cw-exe-99-1", "cw-exe-0-0", "cw-exe-0-9", "cw-manifest-x"] {
+        for bad in [
+            "cw-dev-0",
+            "evil",
+            "cw-exe-99-1",
+            "cw-exe-0-0",
+            "cw-exe-0-9",
+            "cw-manifest-x",
+        ] {
             let mut set = next.names();
             set.insert(bad.to_owned());
             assert!(stale_names(set.iter(), &next.names(), 2).is_err(), "{bad}");

@@ -40,7 +40,16 @@ fn main() -> Result<()> {
     let notify = Notifier::from_environment()?;
     let owner = SystemdOwner::new(UNIT, &notify)?;
     let mut guard = if let Some(held) = inherited {
-        let guard = PersistentGuard::adopt(held, Path::new(BASE), &owner)?;
+        let devices = ["/dev/dri/renderD129", "/dev/dri/card1"]
+            .iter()
+            .map(|path| {
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+                    .open(path)
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let guard = PersistentGuard::adopt(held, devices, Path::new(BASE), &owner)?;
         println!("ADOPTED generation {}", guard.current_generation());
         guard
     } else {

@@ -63,7 +63,7 @@ def main():
 
     def ready(generation):
         assert prop('ActiveState') == 'active'
-        assert prop('NFileDescriptorStore') == '6'
+        assert prop('NFileDescriptorStore') == '4'
         request('status', generation)
         return prop('MainPID')
 
@@ -73,7 +73,7 @@ def main():
             assert time.monotonic() < deadline, 'owner still alive'
             time.sleep(0.05)
         assert prop('ActiveState') == 'failed'
-        assert prop('NFileDescriptorStore') == '6'
+        assert prop('NFileDescriptorStore') == '4'
 
     def receive(process, expected, kind):
         assert select.select([process.stdout], [], [], 10)[0], 'worker timeout'
@@ -170,7 +170,7 @@ def main():
         print('PASS: stale/invalid commits rejected; 300 swaps keep FD store and local handles bounded', flush=True)
 
         control('stop', unit)
-        assert prop('ActiveState') == 'inactive' and prop('NFileDescriptorStore') == '6'
+        assert prop('ActiveState') == 'inactive' and prop('NFileDescriptorStore') == '4'
         access(render, inference)
         control('start', unit)
         ready(305)

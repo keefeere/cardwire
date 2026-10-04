@@ -224,6 +224,9 @@ def main():
         # Interrupted re-enrollment leftovers: inject stray store entries from inside the
         # unit cgroup (VM only, NotifyAccess=all), as a crash between store/cleanup would.
         def inject(name, path):
+            # systemd attributes a notify datagram to the unit by the sender's cgroup
+            # at PROCESSING time, so stay inside the unit cgroup until it is stored.
+            before = int(prop('NFileDescriptorStore'))
             fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
             unit_cgroup = Path('/sys/fs/cgroup/system.slice') / unit
             try:
@@ -231,11 +234,14 @@ def main():
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
                 sock.connect('/run/systemd/notify')
                 socket.send_fds(sock, [f'FDSTORE=1\nFDPOLL=0\nFDNAME={name}'.encode()], [fd])
+                deadline = time.monotonic() + 10
+                while int(prop('NFileDescriptorStore')) != before + 1:
+                    assert time.monotonic() < deadline, 'injected descriptor not stored'
+                    time.sleep(0.05)
                 sock.close()
             finally:
                 Path('/sys/fs/cgroup/cgroup.procs').write_text(str(os.getpid()))
                 os.close(fd)
-            time.sleep(0.5)
 
         inject('cw-cg-0-8', cg)  # plausible uncommitted new reference (generation 7 + 1)
         assert int(prop('NFileDescriptorStore')) == count + 1

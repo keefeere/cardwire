@@ -15,12 +15,13 @@ use std::{
     }, process::Command
 };
 
-const MAGIC: &[u8; 8] = b"CWPST002";
+const MAGIC: &[u8; 8] = b"CWPST003";
 const SEALS: i32 = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
 const MAPS: [&str; 3] = ["CW_ACTIVE", "CW_DEVICES_MAP", "CW_ROLE_TASKS"];
 const LINKS: [&str; 2] = ["exec_link", "open_link"];
 const MANIFEST_PREFIX: &str = "cw-manifest-";
-const BYTES: usize = 8 + 8 + 7 * 4 + size_of::<SnapshotPod>() + size_of::<InventoryPod>();
+const BYTES: usize =
+    8 + 8 + 7 * 4 + size_of::<SnapshotPod>() + size_of::<InventoryPod>() + MAX_ROLES * 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Manifest {
@@ -30,6 +31,8 @@ struct Manifest {
     ids: [u32; 7],
     catalog: Snapshot,
     inventory: Inventory,
+    /// Per role: `st_dev` of its executable at registration (see `Registration::from_held`).
+    exe_stat_dev: [u64; MAX_ROLES],
 }
 
 fn pod_bytes<T: Pod>(value: &T) -> &[u8] {
@@ -69,6 +72,13 @@ impl Manifest {
             self.catalog.roles.iter().all(|r| r.access_mask == 0),
             "catalog must describe denied registrations"
         );
+        ensure!(
+            self.exe_stat_dev
+                .iter()
+                .enumerate()
+                .all(|(n, dev)| (*dev != 0) == (n < self.catalog.role_count as usize)),
+            "executable device list does not match the catalog"
+        );
         Ok(())
     }
 
@@ -80,6 +90,7 @@ impl Manifest {
         bytes.extend_from_slice(pod_bytes(&self.ids));
         bytes.extend_from_slice(pod_bytes(&SnapshotPod(self.catalog)));
         bytes.extend_from_slice(pod_bytes(&InventoryPod(self.inventory)));
+        bytes.extend_from_slice(pod_bytes(&self.exe_stat_dev));
         Ok(bytes)
     }
 
@@ -89,11 +100,13 @@ impl Manifest {
             "invalid owner manifest"
         );
         let split = 44 + size_of::<SnapshotPod>();
+        let inventory_end = split + size_of::<InventoryPod>();
         let result = Self {
             epoch: u64::from_ne_bytes(bytes[8..16].try_into()?),
             ids: read_pod(&bytes[16..44])?,
             catalog: read_pod::<SnapshotPod>(&bytes[44..split])?.0,
-            inventory: read_pod::<InventoryPod>(&bytes[split..])?.0,
+            inventory: read_pod::<InventoryPod>(&bytes[split..inventory_end])?.0,
+            exe_stat_dev: read_pod(&bytes[inventory_end..])?,
         };
         result.validate()?;
         Ok(result)
@@ -440,6 +453,13 @@ impl PersistentGuard {
             ids: [1; 7],
             catalog: guard.current.context("no initial catalog")?,
             inventory: guard.inventory,
+            exe_stat_dev: {
+                let mut devs = [0u64; MAX_ROLES];
+                for (slot, registration) in devs.iter_mut().zip(&registrations) {
+                    *slot = registration.stat_dev;
+                }
+                devs
+            },
         };
         manifest.validate()?;
         let mut held = BTreeMap::new();
@@ -584,12 +604,11 @@ impl PersistentGuard {
         }
         for n in 0..manifest.catalog.role_count as usize {
             let expected = manifest.catalog.roles[n];
-            let role = Registration::new(
+            let role = Registration::from_held(
                 File::from(held[&manifest.exe_name(n)].try_clone()?),
                 File::from(held[&manifest.cg_name(n)].try_clone()?),
-                expected.uid,
-                expected.incarnation,
-                0,
+                &expected,
+                manifest.exe_stat_dev[n],
             )?;
             ensure!(
                 role.rule == expected,
@@ -656,6 +675,11 @@ impl PersistentGuard {
                 .checked_add(1)
                 .context("catalog epoch exhausted")?,
             catalog,
+            exe_stat_dev: {
+                let mut devs = self.manifest.exe_stat_dev;
+                devs[index] = registration.stat_dev;
+                devs
+            },
             ..self.manifest.clone()
         };
         next.validate()?;
@@ -829,6 +853,11 @@ mod tests {
             ids: [1, 2, 3, 4, 5, 6, 7],
             catalog,
             inventory,
+            exe_stat_dev: {
+                let mut devs = [0u64; MAX_ROLES];
+                devs[..2].copy_from_slice(&[58, 58]);
+                devs
+            },
         }
     }
     #[test]

@@ -38,6 +38,53 @@ fn kernel_dev(dev: u64) -> Result<u32> {
     Ok(((major << 20) | minor) as u32)
 }
 
+/// Parse the `major:minor` of the mount with `mount_id` out of mountinfo text.
+/// mountinfo reports the SUPERBLOCK device (`sb->s_dev`), which is what the BPF
+/// hook compares. `st_dev` is NOT that on btrfs subvolumes (anonymous per-subvolume
+/// device), so `stat` must not be used for executable identity.
+fn mountinfo_super_dev(text: &str, mount_id: u64) -> Result<u32> {
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next().and_then(|id| id.parse::<u64>().ok()) != Some(mount_id) {
+            continue;
+        }
+        let (major, minor) = fields
+            .nth(1)
+            .and_then(|dev| dev.split_once(':'))
+            .context("malformed mountinfo device")?;
+        let (major, minor): (u64, u64) = (major.parse()?, minor.parse()?);
+        ensure!(
+            major < 4096 && minor < (1 << 20),
+            "unsupported device number"
+        );
+        return Ok(((major << 20) | minor) as u32);
+    }
+    anyhow::bail!("mount id {mount_id} not found in mountinfo")
+}
+
+/// Kernel `s_dev` of the superblock holding `file` (works for O_PATH descriptors).
+fn superblock_dev(file: &File) -> Result<u32> {
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: valid fd, empty path with AT_EMPTY_PATH, properly sized out struct.
+    let rc = unsafe {
+        libc::statx(
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            libc::STATX_MNT_ID,
+            &mut stx,
+        )
+    };
+    ensure!(
+        rc == 0 && stx.stx_mask & libc::STATX_MNT_ID != 0,
+        "cannot determine the mount of the executable"
+    );
+    mountinfo_super_dev(
+        &std::fs::read_to_string("/proc/self/mountinfo")?,
+        stx.stx_mnt_id,
+    )
+}
+
 fn freeze(fd: BorrowedFd<'_>) -> Result<()> {
     let raw = fd.as_raw_fd() as u32;
     // BPF_MAP_FREEZE=22, bpf_attr.map_fd at offset 0. The kernel zero-fills the
@@ -56,6 +103,9 @@ pub struct Registration {
     rule: Role,
     executable: File,
     cgroup: File,
+    /// `st_dev` of the executable when it was registered. On btrfs subvolumes this
+    /// is an anonymous device, unrelated to the superblock device in `rule`.
+    stat_dev: u64,
 }
 
 impl Registration {
@@ -65,6 +115,17 @@ impl Registration {
         uid: u32,
         incarnation: u64,
         access_mask: u32,
+    ) -> Result<Self> {
+        Self::build(executable, cgroup, uid, incarnation, access_mask, None)
+    }
+
+    fn build(
+        executable: File,
+        cgroup: File,
+        uid: u32,
+        incarnation: u64,
+        access_mask: u32,
+        known_super_dev: Option<u32>,
     ) -> Result<Self> {
         let exe = executable.metadata()?;
         let cg = cgroup.metadata()?;
@@ -82,7 +143,10 @@ impl Registration {
             incarnation,
             cgroup_id: cg.ino(),
             executable_inode: exe.ino(),
-            executable_device: kernel_dev(exe.dev())?,
+            executable_device: match known_super_dev {
+                Some(dev) => dev,
+                None => superblock_dev(&executable)?,
+            },
             uid,
             access_mask,
             reserved: 0,
@@ -91,7 +155,35 @@ impl Registration {
             rule,
             executable,
             cgroup,
+            stat_dev: exe.dev(),
         })
+    }
+
+    /// Re-attach held descriptors to a stored role after a restart. The executable's
+    /// superblock device is NOT recomputed (the descriptor may belong to a mount of a
+    /// previous mount namespace); instead the descriptor must still be the same inode
+    /// on the same `st_dev` as at registration, and the stored value is trusted.
+    pub fn from_held(
+        executable: File,
+        cgroup: File,
+        expected: &Role,
+        stat_dev: u64,
+    ) -> Result<Self> {
+        let exe = executable.metadata()?;
+        ensure!(
+            exe.ino() == expected.executable_inode && exe.dev() == stat_dev,
+            "held executable differs from the stored registration"
+        );
+        let mut registration = Self::build(
+            executable,
+            cgroup,
+            expected.uid,
+            expected.incarnation,
+            0,
+            Some(expected.executable_device),
+        )?;
+        registration.stat_dev = stat_dev;
+        Ok(registration)
     }
 
     /// Permission change retains registration identity and original object FDs.
@@ -103,6 +195,7 @@ impl Registration {
             },
             executable: self.executable.try_clone()?,
             cgroup: self.cgroup.try_clone()?,
+            stat_dev: self.stat_dev,
         })
     }
 }
@@ -248,5 +341,41 @@ impl ServiceGuard {
             "unexpected freeze error: {error}"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod superblock_tests {
+    use super::*;
+
+    // Real host shape: a btrfs subvolume mount. st_dev of its files is an anonymous
+    // device (0:58 there), but the BPF hook sees the superblock device 0:36.
+    const MOUNTINFO: &str = "\
+81 76 0:36 /home /var/home rw,relatime shared:174 - btrfs /dev/mapper/luks rw,subvolid=257,subvol=/home
+30 1 253:0 / / rw - ext4 /dev/vda rw
+31 30 0:25 / /proc rw - proc proc rw";
+
+    #[test]
+    fn mountinfo_gives_the_superblock_device() {
+        assert_eq!(mountinfo_super_dev(MOUNTINFO, 81).unwrap(), 36);
+        assert_eq!(mountinfo_super_dev(MOUNTINFO, 30).unwrap(), 253 << 20);
+        assert_eq!(mountinfo_super_dev(MOUNTINFO, 31).unwrap(), 25);
+    }
+
+    #[test]
+    fn mountinfo_rejects_unknown_or_malformed() {
+        assert!(mountinfo_super_dev(MOUNTINFO, 999).is_err());
+        assert!(mountinfo_super_dev("81 76 bogus / /x", 81).is_err());
+        assert!(mountinfo_super_dev("81 76 5000:0 / /x", 81).is_err());
+    }
+
+    #[test]
+    fn live_superblock_dev_matches_procfs_and_is_stable() {
+        // procfs has no subvolume trick: st_dev is the superblock device there.
+        let proc = File::open("/proc/self/status").unwrap();
+        let from_stat = kernel_dev(proc.metadata().unwrap().dev()).unwrap();
+        assert_eq!(superblock_dev(&proc).unwrap(), from_stat);
+        let exe = File::open("/proc/self/exe").unwrap();
+        assert_eq!(superblock_dev(&exe).unwrap(), superblock_dev(&exe).unwrap());
     }
 }

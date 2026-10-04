@@ -109,7 +109,8 @@ def main():
             f'devices = ["{node}"]\n[[role]]\nexecutable = "{exe}"\n'
             f'cgroup = "{cg}"\nuid = 0\n'
             '[[profile]]\nname = "open"\npermissions = [1]\n'
-            '[[profile]]\nname = "closed"\npermissions = [0]\n')
+            '[[profile]]\nname = "closed"\npermissions = [0]\n'
+            '[[profile]]\nname = "everyone"\npermissions = [0]\ndefault_mask = 1\n')
         os.chmod(config, 0o600)
         control('start', unit)
         pid = wait_active()
@@ -159,11 +160,23 @@ def main():
         allowed()
         print('PASS: named profiles apply atomically; unknown/non-root rejected; CurrentProfile derived', flush=True)
 
+        # Default (non-role) mask: Gaming-style profile admits every process.
+        r = profile('everyone')
+        assert r.returncode == 0 and r.stdout.split() == ['t', '5'], r
+        assert current() == 'everyone'
+        spawn(outside, 0)
+        spawn(cg, 0)
+        r = profile('open')
+        assert r.returncode == 0 and r.stdout.split() == ['t', '6'], r
+        spawn(outside, -13)  # roles-only again
+        allowed()
+        print('PASS: default mask admits non-role processes only while the profile says so', flush=True)
+
         control('kill', '--kill-whom=main', '--signal=KILL', unit)
         allowed()  # during the dead/restart window
         pid = wait_active(pid)
         assert int(prop('NFileDescriptorStore')) == count
-        assert 'service-roles: adopted generation 4' in journal(), journal()
+        assert 'service-roles: adopted generation 6' in journal(), journal()
         allowed()
         legacy_works()
         print('PASS: SIGKILL: committed permissions persisted and restarted daemon adopted stored guard', flush=True)
@@ -188,7 +201,7 @@ def main():
         assert busctl(*reenroll, '0', exe, str(cg)).returncode != 0    # unchanged identity
         assert busctl(*reenroll, '0', '../x', str(cg2)).returncode != 0
         r = busctl(*reenroll, '0', exe, str(cg2))
-        assert r.returncode == 0 and r.stdout.split() == ['t', '5'], r
+        assert r.returncode == 0 and r.stdout.split() == ['t', '7'], r
         assert int(prop('NFileDescriptorStore')) == count  # stale references removed
         assert current() == 'open'                          # permission mask kept
         spawn(cg, -13)       # old cgroup identity no longer admitted
@@ -202,7 +215,7 @@ def main():
         spawn(cg, -13)
         pid = wait_active(pid)
         assert int(prop('NFileDescriptorStore')) == count
-        assert 'service-roles: adopted generation 5' in journal(), journal()
+        assert 'service-roles: adopted generation 7' in journal(), journal()
         spawn(cg2, 0)
         spawn(cg, -13)
         print('PASS: SIGKILL after re-enrollment adopts the new catalog epoch', flush=True)

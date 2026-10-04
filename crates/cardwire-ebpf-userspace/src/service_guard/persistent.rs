@@ -735,7 +735,18 @@ impl PersistentGuard {
             .collect()
     }
 
+    /// Devices any process may open (non-role processes included).
+    pub fn default_mask(&self) -> u32 {
+        self.current.default_mask
+    }
+
+    /// Replace role masks, keeping the current default mask.
     pub fn prepare_permissions(&self, masks: &[u32]) -> Result<PreparedPermissions> {
+        self.prepare_policy(masks, self.current.default_mask)
+    }
+
+    /// Replace role masks AND the default (non-role) mask as one generation.
+    pub fn prepare_policy(&self, masks: &[u32], default_mask: u32) -> Result<PreparedPermissions> {
         ensure!(
             masks.len() == self.current.role_count as usize,
             "wrong permission count"
@@ -748,6 +759,7 @@ impl PersistentGuard {
         for (role, mask) in snapshot.roles.iter_mut().zip(masks) {
             role.access_mask = *mask;
         }
+        snapshot.default_mask = default_mask;
         snapshot
             .validate(Some(&self.current), self.manifest.inventory.count as usize)
             .map_err(|e| anyhow!(e))?;

@@ -27,7 +27,7 @@ struct role {
 struct snapshot {
     __u32 magic, version;
     __u64 generation;
-    __u32 role_count, reserved;
+    __u32 role_count, default_mask; /* devices any process may open */
     struct role roles[CW_ROLES];
 };
 struct inventory { __u32 count, reserved, devices[CW_DEVICES]; };
@@ -72,7 +72,7 @@ static __always_inline struct snapshot *policy(void)
     if (!inner) return 0;
     struct snapshot *s = bpf_map_lookup_elem(inner, &zero);
     if (!s || s->magic != CW_MAGIC || s->version != CW_VERSION || !s->generation ||
-        s->reserved || s->role_count > CW_ROLES) return 0;
+        s->role_count > CW_ROLES) return 0;
     return s;
 }
 
@@ -133,6 +133,7 @@ int service_open(__u64 *ctx)
      * published config/roles maps. No policy pointer means deny protected nodes. */
     struct snapshot *s = policy();
     if (!s) return -13;
+    if (s->default_mask & access) return 0;
     struct task_struct *task = bpf_get_current_task_btf();
     struct task_struct *leader = task->group_leader;
     if (!leader) return -13;

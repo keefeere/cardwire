@@ -34,7 +34,9 @@ pub struct Snapshot {
     pub version: u32,
     pub generation: u64,
     pub role_count: u32,
-    pub reserved: u32,
+    /// Devices (bit n = inventory device n) ANY process may open, with or without
+    /// an admitted role. Zero (the initial state) denies every non-role process.
+    pub default_mask: u32,
     pub roles: [Role; MAX_ROLES],
 }
 
@@ -45,7 +47,7 @@ impl Snapshot {
             version: VERSION,
             generation,
             role_count: 0,
-            reserved: 0,
+            default_mask: 0,
             roles: [Role::default(); MAX_ROLES],
         }
     }
@@ -60,7 +62,6 @@ impl Snapshot {
     ) -> Result<(), &'static str> {
         if self.magic != MAGIC
             || self.version != VERSION
-            || self.reserved != 0
             || self.generation == 0
             || self.role_count as usize > MAX_ROLES
             || device_count == 0
@@ -72,6 +73,9 @@ impl Snapshot {
             return Err("policy generation must increase");
         }
         let valid_mask = (1u32 << device_count) - 1;
+        if self.default_mask & !valid_mask != 0 {
+            return Err("invalid default device permissions");
+        }
         for (index, role) in self.roles.iter().enumerate() {
             if index >= self.role_count as usize {
                 if *role != Role::default() {
@@ -224,7 +228,7 @@ mod tests {
             |s: &mut Snapshot| s.role_count = 17,
             |s: &mut Snapshot| s.magic = 0,
             |s: &mut Snapshot| s.version = 2,
-            |s: &mut Snapshot| s.reserved = 1,
+            |s: &mut Snapshot| s.default_mask = 4,
             |s: &mut Snapshot| s.generation = 0,
         ] {
             bad = old;

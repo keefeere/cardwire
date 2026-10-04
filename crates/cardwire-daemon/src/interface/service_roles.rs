@@ -38,6 +38,14 @@ impl ServiceRolesInterface {
         Ok(guard.permissions())
     }
 
+    /// Devices any process may open, with or without an admitted role.
+    #[zbus(property)]
+    fn default_mask(&self) -> fdo::Result<u32> {
+        let guard = owner()?;
+        let guard = guard.lock().map_err(|_| fdo::Error::Failed("owner poisoned".into()))?;
+        Ok(guard.default_mask())
+    }
+
     /// Names of the profiles configured in service-roles.toml.
     #[zbus(property)]
     fn profiles(&self) -> Vec<String> {
@@ -55,10 +63,10 @@ impl ServiceRolesInterface {
         let guard = guard
             .lock()
             .map_err(|_| fdo::Error::Failed("owner poisoned".into()))?;
-        let live = guard.permissions();
+        let (live, default) = (guard.permissions(), guard.default_mask());
         Ok(service_owner::profiles()
             .iter()
-            .find(|p| p.permissions == live)
+            .find(|p| p.permissions == live && p.default_mask == default)
             .map(|p| p.name.clone())
             .unwrap_or_default())
     }
@@ -80,7 +88,7 @@ impl ServiceRolesInterface {
             .lock()
             .map_err(|_| fdo::Error::Failed("owner poisoned".into()))?;
         let prepared = guard
-            .prepare_permissions(&profile.permissions)
+            .prepare_policy(&profile.permissions, profile.default_mask)
             .map_err(|e| fdo::Error::InvalidArgs(format!("{e:#}")))?;
         guard
             .commit(prepared)

@@ -52,6 +52,9 @@ pub struct RoleConfig {
 pub struct ProfileConfig {
     pub name: String,
     pub permissions: Vec<u32>,
+    /// Devices ANY process may open (bit n = catalog device n); 0 = roles only.
+    #[serde(default)]
+    pub default_mask: u32,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -128,6 +131,11 @@ impl ServiceRolesConfig {
                         .iter()
                         .all(|m| u64::from(*m) & !valid_bits == 0),
                 "profile {} must have one valid mask per role",
+                profile.name
+            );
+            ensure!(
+                u64::from(profile.default_mask) & !valid_bits == 0,
+                "profile {} default_mask names unknown devices",
                 profile.name
             );
         }
@@ -359,6 +367,19 @@ permissions = [60, 0]
             ),
             (7, 2, 3)
         );
+    }
+
+    #[test]
+    fn profile_default_mask_is_bounded() {
+        let ok =
+            format!("{GOOD}\n[[profile]]\nname = \"g\"\npermissions = [0]\ndefault_mask = 3\n");
+        assert_eq!(
+            ServiceRolesConfig::parse(&ok).unwrap().profiles[0].default_mask,
+            3
+        );
+        let bad =
+            format!("{GOOD}\n[[profile]]\nname = \"g\"\npermissions = [0]\ndefault_mask = 4\n");
+        assert!(ServiceRolesConfig::parse(&bad).is_err());
     }
 
     #[test]

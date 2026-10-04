@@ -687,13 +687,17 @@ impl PersistentGuard {
             fs::metadata(&group)?.ino() == role.cgroup_id,
             "process cgroup is not the role's cgroup"
         );
-        // The pidfd was opened before /proc was read: if the process exited in
-        // between, signal 0 fails and nothing is written.
-        // SAFETY: valid pidfd, null siginfo, no flags.
-        ensure!(
-            unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), 0, 0, 0) } == 0,
-            "process vanished during verification"
-        );
+        // The pidfd was opened before /proc was read; it becomes readable once the
+        // process has exited. poll needs no privilege (the daemon has no CAP_KILL, so
+        // signalling another user's process is not an option).
+        let mut watch = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd, zero timeout.
+        let ready = unsafe { libc::poll(&mut watch, 1, 0) };
+        ensure!(ready == 0, "process vanished during verification");
         let key = pidfd.as_raw_fd();
         let ticket = cardwire_policy::service_roles::Ticket {
             incarnation: role.incarnation,

@@ -270,6 +270,16 @@ pub fn re_enroll(index: usize, executable: &str, cgroup: &str) -> Result<u64> {
     guard.reenroll(index, executable, cgroup, &owner)
 }
 
+/// Admit an already running process to a role (see `PersistentGuard::admit_process`).
+/// Root authorization is the caller's job.
+pub fn admit_process(pid: u32, role: usize) -> Result<()> {
+    let guard = guard().context("service roles are not active")?;
+    let guard = guard
+        .lock()
+        .map_err(|_| anyhow::anyhow!("owner poisoned"))?;
+    guard.admit_process(pid, role)
+}
+
 /// Single-threaded startup entry. MUST be the first thing `main` does after logging.
 /// On success the guard lives for the process lifetime in [`guard()`].
 pub fn start() {

@@ -63,6 +63,25 @@ def main():
         assert p.wait(timeout=10) == 0
         children.remove(p)
 
+    def spawn_long(group, expected):
+        # A worker that stays alive: its exec happened BEFORE any enrollment/ticket.
+        def setup():
+            (group / 'cgroup.procs').write_text(str(os.getpid()))
+        p = subprocess.Popen([exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             text=True, bufsize=1, preexec_fn=setup)
+        children.append(p)
+        assert select.select([p.stdout], [], [], 10)[0], 'worker timeout'
+        words = p.stdout.readline().split()
+        assert words[0] == 'constructor' and int(words[2]) == expected, (words, expected)
+        return p
+
+    def long_open(p, expected):
+        p.stdin.write('open\n')
+        p.stdin.flush()
+        assert select.select([p.stdout], [], [], 10)[0], 'worker timeout'
+        words = p.stdout.readline().split()
+        assert words[0] == 'open' and int(words[2]) == expected, (words, expected)
+
     active = [cg]  # cgroup of the currently enrolled role
 
     def denied():
@@ -193,6 +212,7 @@ def main():
         # Service restart recreated its cgroup: re-enroll the SAME role index.
         cg2.mkdir()
         spawn(cg2, -13)  # not enrolled yet
+        running = spawn_long(cg2, -13)  # lives through enrollment, never exec'd under the role
         allowed()
         reenroll = ['call', 'org.opengamingcollective.cardwire',
                     '/org/opengamingcollective/cardwire',
@@ -211,6 +231,24 @@ def main():
         active[0] = cg2
         print('PASS: re-enrollment swaps the role identity atomically, keeps mask and FD count', flush=True)
 
+        # AdmitProcess: adopt the RUNNING worker (no exec) without widening anything else.
+        admit = ['call', 'org.opengamingcollective.cardwire', '/org/opengamingcollective/cardwire',
+                 'org.opengamingcollective.cardwire.ServiceRoles', 'AdmitProcess', 'uu']
+        long_open(running, -13)  # matches the role but holds no ticket
+        assert busctl(*admit, str(running.pid), '0', user='nobody').returncode != 0
+        assert busctl(*admit, str(running.pid), '9').returncode != 0  # unknown role
+        stranger = spawn_long(outside, -13)
+        assert busctl(*admit, str(stranger.pid), '0').returncode != 0, 'admitted a process outside the role cgroup'
+        long_open(stranger, -13)
+        stranger.stdin.close()
+        stranger.wait(timeout=10)
+        children.remove(stranger)
+        r = busctl(*admit, str(running.pid), '0')
+        assert r.returncode == 0, r
+        long_open(running, 0)
+        spawn(outside, -13)
+        print('PASS: AdmitProcess adopts the running matching process only (root-only, identity checked)', flush=True)
+
         control('kill', '--kill-whom=main', '--signal=KILL', unit)
         spawn(cg2, 0)
         spawn(cg, -13)
@@ -219,6 +257,7 @@ def main():
         assert 'service-roles: adopted generation 8' in journal(), journal()
         spawn(cg2, 0)
         spawn(cg, -13)
+        long_open(running, 0)  # the admission ticket lives in the pinned map
         print('PASS: SIGKILL after re-enrollment adopts the new catalog epoch', flush=True)
 
         # Interrupted re-enrollment leftovers: inject stray store entries from inside the

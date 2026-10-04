@@ -424,6 +424,34 @@ pub struct PersistentGuard {
     manifest: Manifest,
     current: Snapshot,
     held: BTreeMap<String, OwnedFd>,
+    /// Pinned task-storage map holding per-process admission tickets.
+    tasks: MapData,
+}
+
+/// Real/effective uid of a process from `/proc/<pid>/status` text.
+fn status_uid(text: &str) -> Result<u32> {
+    let line = text
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))
+        .context("no Uid line")?;
+    let ids: Vec<u32> = line
+        .split_whitespace()
+        .map(str::parse)
+        .collect::<std::result::Result<_, _>>()?;
+    ensure!(ids.len() >= 2, "short Uid line");
+    ensure!(ids[0] == ids[1], "real and effective uid differ");
+    Ok(ids[0])
+}
+
+/// cgroup v2 path of a process from `/proc/<pid>/cgroup` text.
+fn cgroup_v2_path(text: &str) -> Result<&str> {
+    let mut found = text.lines().filter_map(|l| l.strip_prefix("0::"));
+    let path = found.next().context("no cgroup v2 entry")?;
+    ensure!(
+        found.next().is_none() && path.starts_with('/') && !path.split('/').any(|c| c == ".."),
+        "unexpected cgroup path"
+    );
+    Ok(path)
 }
 
 impl PersistentGuard {
@@ -620,7 +648,80 @@ impl PersistentGuard {
             manifest,
             current,
             held,
+            tasks: MapData::from_pin(base.join(MAPS[2]))?,
         })
+    }
+
+    /// Admit an ALREADY RUNNING process (thread-group leader) to a catalog role, as
+    /// the exec hook would have: used when enrollment could not precede its exec
+    /// (e.g. the desktop compositor). The process must match the role's exact
+    /// executable inode, uid and cgroup right now; the kernel re-checks all three on
+    /// every protected open, so a later change of any of them revokes access.
+    pub fn admit_process(&self, pid: u32, role_index: usize) -> Result<()> {
+        ensure!(role_index < self.role_count(), "unknown role");
+        let role = self.current.roles[role_index];
+        // SAFETY: plain syscall; the result is wrapped immediately.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        ensure!(
+            raw >= 0,
+            "cannot open pidfd for {pid} (not a thread-group leader?): {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: freshly returned, owned descriptor.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+        let proc = std::path::PathBuf::from(format!("/proc/{pid}"));
+        let exe = File::open(proc.join("exe"))?.metadata()?;
+        ensure!(
+            exe.ino() == role.executable_inode
+                && exe.dev() == self.manifest.exe_stat_dev[role_index],
+            "process executable is not the role's executable"
+        );
+        ensure!(
+            status_uid(&fs::read_to_string(proc.join("status"))?)? == role.uid,
+            "process uid is not the role's uid"
+        );
+        let cgroup = fs::read_to_string(proc.join("cgroup"))?;
+        let group =
+            Path::new("/sys/fs/cgroup").join(cgroup_v2_path(&cgroup)?.trim_start_matches('/'));
+        ensure!(
+            fs::metadata(&group)?.ino() == role.cgroup_id,
+            "process cgroup is not the role's cgroup"
+        );
+        // The pidfd was opened before /proc was read: if the process exited in
+        // between, signal 0 fails and nothing is written.
+        // SAFETY: valid pidfd, null siginfo, no flags.
+        ensure!(
+            unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), 0, 0, 0) } == 0,
+            "process vanished during verification"
+        );
+        let key = pidfd.as_raw_fd();
+        let ticket = cardwire_policy::service_roles::Ticket {
+            incarnation: role.incarnation,
+            role_index: role_index as u32,
+            reserved: 0,
+        };
+        // bpf_attr for BPF_MAP_UPDATE_ELEM: map_fd, pad, key, value, flags.
+        let attr: [u64; 4] = [
+            u64::from(self.tasks.fd().as_fd().as_raw_fd() as u32),
+            (&key as *const i32) as u64,
+            (&ticket as *const _) as u64,
+            0,
+        ];
+        // SAFETY: attr/key/ticket are live and sized for the kernel's reads.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                2u32,
+                attr.as_ptr(),
+                size_of::<[u64; 4]>() as u32,
+            )
+        };
+        ensure!(
+            result == 0,
+            "cannot record the admission ticket: {}",
+            io::Error::last_os_error()
+        );
+        Ok(())
     }
 
     /// Catalog uid of one role (re-enrollment keeps it).
@@ -877,6 +978,24 @@ mod tests {
         invalid[0] = 0;
         assert!(Manifest::decode(&invalid).is_err());
     }
+    #[test]
+    fn proc_text_parsers_are_strict() {
+        assert_eq!(
+            status_uid("Name:\tx\nUid:\t1000\t1000\t1000\t1000\n").unwrap(),
+            1000
+        );
+        assert!(status_uid("Uid:\t1000\t0\t0\t0\n").is_err()); // setuid-style mismatch
+        assert!(status_uid("Name:\tx\n").is_err());
+        assert!(status_uid("Uid:\t1000\n").is_err());
+        assert_eq!(
+            cgroup_v2_path("0::/system.slice/a.service\n").unwrap(),
+            "/system.slice/a.service"
+        );
+        assert!(cgroup_v2_path("1:cpu:/x\n").is_err());
+        assert!(cgroup_v2_path("0::/a/../b\n").is_err());
+        assert!(cgroup_v2_path("0::/a\n0::/b\n").is_err());
+    }
+
     #[test]
     fn catalog_accepts_only_permission_changes() {
         let manifest = sample();

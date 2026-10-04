@@ -42,7 +42,9 @@ impl ServiceRolesInterface {
     #[zbus(property)]
     fn default_mask(&self) -> fdo::Result<u32> {
         let guard = owner()?;
-        let guard = guard.lock().map_err(|_| fdo::Error::Failed("owner poisoned".into()))?;
+        let guard = guard
+            .lock()
+            .map_err(|_| fdo::Error::Failed("owner poisoned".into()))?;
         Ok(guard.default_mask())
     }
 
@@ -113,6 +115,23 @@ impl ServiceRolesInterface {
         .await
         .map_err(|e| fdo::Error::Failed(e.to_string()))?
         .map_err(|e| fdo::Error::Failed(format!("{e:#}")))
+    }
+
+    /// Admit a RUNNING process (thread-group leader) to a role it already matches by exact
+    /// executable inode, uid and cgroup (root only). For processes whose exec could not
+    /// be preceded by enrollment, e.g. the desktop compositor.
+    async fn admit_process(
+        &self,
+        pid: u32,
+        role: u32,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<()> {
+        authorize_process_request(connection, &header).await?;
+        tokio::task::spawn_blocking(move || service_owner::admit_process(pid, role as usize))
+            .await
+            .map_err(|e| fdo::Error::Failed(e.to_string()))?
+            .map_err(|e| fdo::Error::Failed(format!("{e:#}")))
     }
 
     /// Atomically replace ALL role masks (root only). Wrong length, unknown
